@@ -1,6 +1,6 @@
 """Normalize Arbeitnow listings into the shared Job shape."""
 
-from Server.api import ApiError, Job, clean, extract_salary, fetch_arbeitnow_jobs, job_profile, select_jobs, to_datetime
+from Server.api import ApiError, Job, clean, extract_salary, fetch_arbeitnow_jobs, job_profile, select_jobs, split_description, to_datetime
 
 
 class Arbeitnow:
@@ -35,6 +35,7 @@ class Arbeitnow:
             title = clean(item.get("title"))
             body = item.get("description") or ""
             experience, skill = job_profile(title, body, item.get("tags"))
+            about_company, job_description = split_description(body)
             jobs.append(
                 Job(
                     source=self.label,
@@ -46,6 +47,8 @@ class Arbeitnow:
                     experience=experience,
                     skill=skill,
                     salary=extract_salary(body),
+                    about_company=about_company,
+                    job_description=job_description,
                 )
             )
         return select_jobs(jobs, query, where, limit)
