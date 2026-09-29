@@ -8,6 +8,7 @@ import './nav.css'
 const navigationItems = [
   { label: 'Dashboard', path: '/dashboard', icon: 'dashboard' },
   { label: 'Job Discovery', path: '/job-discovery', icon: 'search' },
+  { label: 'Jobs', path: '/jobs', icon: 'jobs' },
   { label: 'Recommended Jobs', path: '/recommended-jobs', icon: 'sparkles' },
   { label: 'Applications', path: '/applications', icon: 'applications' },
   { label: 'Resume Analyzer', path: '/resume-analyzer', icon: 'resume' },
@@ -31,6 +32,7 @@ function NavIcon({ name }) {
   const icons = {
     dashboard: <><rect x="4" y="4" width="6" height="6" rx="1" /><rect x="14" y="4" width="6" height="6" rx="1" /><rect x="4" y="14" width="6" height="6" rx="1" /><rect x="14" y="14" width="6" height="6" rx="1" /></>,
     search: <><circle cx="10.8" cy="10.8" r="6.8" /><path d="m16 16 4.5 4.5" /></>,
+    jobs: <><rect x="3" y="7" width="18" height="13" rx="2" /><path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M3 12h18M10 12v2h4v-2" /></>,
     sparkles: <><path d="m12 3 1.6 5.4L19 10l-5.4 1.6L12 17l-1.6-5.4L5 10l5.4-1.6L12 3Z" /><path d="m19 15 .8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15Z" /></>,
     applications: <><rect x="5" y="4" width="14" height="16" rx="2" /><path d="M9 4V2h6v2M9 9h6M9 13h6M9 17h3" /></>,
     resume: <><path d="M6 3h8l5 5v5M14 3v6h5M6 3v18h7" /><circle cx="17" cy="17" r="3" /><path d="m19.2 19.2 2 2" /></>,

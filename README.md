@@ -32,7 +32,7 @@ python backend/Server/server.py --list
 
 `--limit` is the number of jobs per portal. `--query` matches the title, company, or location. `--where` matches a city or location. `--no-open` prints the LinkedIn search link without opening the browser.
 
-Each job is printed as JSON with company, role, experience, skill, salary, added on, location, and link. With `--source all`, each record also includes `portal`.
+Each job is printed as JSON with company, role, experience, skill, salary, added on, location, description, and link. `description` has `about company` and `job description`. With `--source all`, each record also includes `portal`.
 
 ## One company or a few companies
 
@@ -71,6 +71,28 @@ python backend/Server/server.py --source all --query automation --limit 5 --sort
 ```powershell
 python backend/Server/server.py --source arbeitnow --query automation --limit 5 --sort exp_desc
 ```
+
+## Jobs page (web app)
+
+The same jobs can be browsed in the browser. Start the API in one terminal:
+
+```powershell
+python backend/Server/server.py
+```
+
+That serves `http://127.0.0.1:8001/api/jobs`. A fetch keeps every opening from the last 30 days and writes `backend/data/jobs.json` as results arrive, so the jobs page shows cards while other companies are still loading. Later page loads read the finished file. Refresh starts that fetch again. The jobs page shows 20 jobs per page. Search, portal, date, and sort run in the browser.
+
+Start the web app in a second terminal:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Open [http://localhost:8002/#/jobs](http://localhost:8002/#/jobs). The page has search, location, and portal, plus posted-date buttons (Today, Last 7 days, Last 30 days) and sorting, which apply instantly to the loaded list. Each card shows the company, role, location, work mode, experience, salary, and an Apply link on the right. Click a card to open the description underneath it.
+
+Point the page at a different API host with `VITE_JOBS_API_URL` in the repository `.env`.
 
 ## Adzuna
 

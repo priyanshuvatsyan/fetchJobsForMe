@@ -1,6 +1,6 @@
 """Normalize RemoteOK listings into the shared Job shape."""
 
-from Server.api import ApiError, Job, clean, extract_salary, fetch_remoteok_jobs, job_profile, money_span, select_jobs, to_datetime
+from Server.api import ApiError, Job, clean, extract_salary, fetch_remoteok_jobs, job_profile, money_span, select_jobs, split_description, to_datetime
 
 
 class RemoteOK:
@@ -31,6 +31,7 @@ class RemoteOK:
             title = clean(item.get("position"))
             body = item.get("description") or ""
             experience, skill = job_profile(title, body, item.get("tags"))
+            about_company, job_description = split_description(body)
             jobs.append(
                 Job(
                     source=self.label,
@@ -42,6 +43,8 @@ class RemoteOK:
                     experience=experience,
                     skill=skill,
                     salary=money_span(item.get("salary_min"), item.get("salary_max")) or extract_salary(body),
+                    about_company=about_company,
+                    job_description=job_description,
                 )
             )
         return select_jobs(jobs, query, where, limit)

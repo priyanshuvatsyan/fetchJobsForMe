@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
+import { BrowserRouter, Navigate, Outlet, Route, Routes } from 'react-router-dom'
 import { onAuthStateChanged } from 'firebase/auth'
 import Nav from './components/nav/nav'
 import { auth } from './firebase'
@@ -13,8 +13,9 @@ import EmailResponses from './pages/EmailResponses/EmailResponses'
 import SkillsProfile from './pages/SkillsProfile/SkillsProfile'
 import AgentActivity from './pages/AgentActivity/AgentActivity'
 import Settings from './pages/Settings/Settings'
-import { Outlet } from 'react-router-dom'
 import './App.css'
+
+import JobsPage from './pages/Jobs/JobsPage'
 
 function RequireAuth() {
   const [user, setUser] = useState(null)
@@ -48,21 +49,22 @@ function App() {
     <BrowserRouter>
       <Routes>
         <Route path="/login" element={<Login />} />
-        <Route element={<RequireAuth />}>
-          <Route element={<AppLayout />}>
-          <Route index element={<Navigate to="/dashboard" replace />} />
-          <Route path="dashboard" element={<Dashboard />} />
-          <Route path="job-discovery" element={<JobDiscovery />} />
-          <Route path="recommended-jobs" element={<RecommendedJobs />} />
-          <Route path="applications" element={<Applications />} />
-          <Route path="resume-analyzer" element={<ResumeAnalyzer />} />
-          <Route path="email-responses" element={<EmailResponses />} />
-          <Route path="skills-profile" element={<SkillsProfile />} />
-          <Route path="agent-activity" element={<AgentActivity />} />
-          <Route path="settings" element={<Settings />} />
+        <Route element={<AppLayout />}>
+          <Route path="jobs" element={<JobsPage />} />
+          <Route element={<RequireAuth />}>
+            <Route index element={<Navigate to="/dashboard" replace />} />
+            <Route path="dashboard" element={<Dashboard />} />
+            <Route path="job-discovery" element={<JobDiscovery />} />
+            <Route path="recommended-jobs" element={<RecommendedJobs />} />
+            <Route path="applications" element={<Applications />} />
+            <Route path="resume-analyzer" element={<ResumeAnalyzer />} />
+            <Route path="email-responses" element={<EmailResponses />} />
+            <Route path="skills-profile" element={<SkillsProfile />} />
+            <Route path="agent-activity" element={<AgentActivity />} />
+            <Route path="settings" element={<Settings />} />
           </Route>
         </Route>
-        <Route path="*" element={<Navigate to="/" replace />} />
+        <Route path="*" element={<Navigate to="/login" replace />} />
       </Routes>
     </BrowserRouter>
   )
