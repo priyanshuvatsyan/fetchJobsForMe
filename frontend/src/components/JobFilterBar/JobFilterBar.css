@@ -1,0 +1,43 @@
+.job-filter-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 18px;
+  background: var(--jb-surface-2);
+  border: 1px solid var(--jb-border);
+  border-radius: var(--jb-radius);
+}
+
+.job-filter-row {
+  display: grid;
+  grid-template-columns: 2fr 1.4fr 1fr;
+  gap: 14px;
+  align-items: start;
+}
+
+.job-filter-row-secondary {
+  grid-template-columns: auto 1fr 1.6fr auto;
+  padding-top: 16px;
+  border-top: 1px solid var(--jb-border);
+}
+
+.job-filter-reset {
+  display: flex;
+  align-items: flex-end;
+  height: 100%;
+  padding-bottom: 1px;
+}
+
+@media (max-width: 1080px) {
+  .job-filter-row,
+  .job-filter-row-secondary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 620px) {
+  .job-filter-row,
+  .job-filter-row-secondary {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

@@ -15,7 +15,7 @@ import urllib.request
 from concurrent.futures import FIRST_COMPLETED, CancelledError, ThreadPoolExecutor, wait
 from pathlib import Path
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 USER_AGENT = "fetchJobsForMe/0.1 (personal job search; public APIs only)"
 # RemoteOK's public JSON API redirect-loops unless the client sends a browser User-Agent.
@@ -30,6 +30,7 @@ CACHE_TTL_SECONDS = 2 * 60 * 60
 GREENHOUSE_JOBS_URL = "https://boards-api.greenhouse.io/v1/boards/{board}/jobs"
 GREENHOUSE_JOB_URL = "https://boards-api.greenhouse.io/v1/boards/{board}/jobs/{job_id}"
 LEVER_POSTINGS_URL = "https://api.lever.co/v0/postings/{site}"
+_LEVER_PAGE = 100
 ASHBY_BOARD_URL = "https://api.ashbyhq.com/posting-api/job-board/{board}"
 REMOTIVE_JOBS_URL = "https://remotive.com/api/remote-jobs"
 REMOTEOK_JOBS_URL = "https://remoteok.com/api"
@@ -56,6 +57,8 @@ class Job:
     experience: str = ""
     skill: str = ""
     salary: str = ""
+    about_company: str = ""
+    job_description: str = ""
 
 
 _YEARS = re.compile(
@@ -64,6 +67,17 @@ _YEARS = re.compile(
 )
 _DEGREE = re.compile(r"((?:bachelor|master|ph\.?d|mba)(?:['’]s)?(?:\s+degree)?)", re.I)
 _LEVEL = re.compile(r"\b(intern|junior|senior|staff|principal|lead|director|head)\b", re.I)
+
+
+_board_client: ApiClient | None = None
+
+
+def get_board_client() -> ApiClient:
+    """Shorter timeout for company-board calls. A missing board should fail fast."""
+    global _board_client
+    if _board_client is None:
+        _board_client = ApiClient(timeout=12)
+    return _board_client
 
 
 class ApiClient:
@@ -160,6 +174,17 @@ def clean(value) -> str:
     return " ".join(str(value or "").split())
 
 
+def within_days(posted_at: str, days: int) -> bool:
+    """True when a portal timestamp falls inside the last `days` days."""
+    if not posted_at or days <= 0:
+        return False
+    try:
+        moment = datetime.strptime(posted_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return datetime.now(timezone.utc) - moment <= timedelta(days=days)
+
+
 def to_datetime(value) -> str:
     """Portal create time as UTC 'YYYY-MM-DD HH:MM:SS'."""
     if value is None or value == "":
@@ -211,6 +236,156 @@ def plain_text(value: str) -> str:
     text = html.unescape(html.unescape(value or ""))
     text = re.sub(r"<[^>]+>", " ", text)
     return clean(text)
+
+
+_JOB_HEADING = re.compile(
+    r"^(?:"
+    r"what you'll (?:do|be doing|bring|need)|"
+    r"what you will do|"
+    r"(?:your |key |core |the )?responsibilities|"
+    r"about (?:the |this )?role|"
+    r"(?:the )?role(?: overview)?|"
+    r"job (?:description|summary|duties)|"
+    r"(?:brief )?description of (?:the )?duties|"
+    r"(?:minimum |preferred |basic |required )?qualifications|"
+    r"requirements|"
+    r"who you are|"
+    r"about you|"
+    r"in this role|"
+    r"a day in the life|"
+    r"duties|"
+    r"what we're looking for|"
+    r"benefits"
+    r")$",
+    re.I,
+)
+_ROLE_START = re.compile(
+    r"^(?:"
+    r"(?:we're|we are)\s+(?:looking for|seeking|hiring)\b|"
+    r"in this role\b|"
+    r"you will be responsible\b|"
+    r"as (?:a|an) (?!small\b|team\b|company\b|whole\b|result\b)"
+    r")",
+    re.I,
+)
+_GLUED_JOB = re.compile(
+    r"^(?:your (?:mission|tasks|profile|role)|in this role|what you'll do|responsibilities)\b",
+    re.I,
+)
+_ABOUT_HEADING = re.compile(
+    r"^(?:about (?:the |our )?company|about us|who we are|our story|company overview)$",
+    re.I,
+)
+_GLUED_ABOUT = re.compile(r"^(?:about us|about the company|about our company|who we are)\b", re.I)
+_NAMED_ABOUT = re.compile(
+    r"^about (?!the role\b)(?!this role\b)(?!you\b)(?!the job\b)(?!the position\b)\S.{0,40}$",
+    re.I,
+)
+_COMPANYISH = re.compile(
+    r"\b(?:our mission|our company|our team|our platform|we are|we're|founded|"
+    r"headquartered|is an? |helps |helping )\b",
+    re.I,
+)
+_ALREADY_ROLE = re.compile(r"^(?:job title\b|reports to\b|this (?:is|role)\b)", re.I)
+_INTRO_DIV = re.compile(
+    r'<div[^>]*class="[^"]*content-intro[^"]*"[^>]*>(.*?)</div>',
+    re.I | re.S,
+)
+
+
+def _norm(value: str) -> str:
+    return value.replace("’", "'").replace("‘", "'").replace("`", "'")
+
+
+def _html_lines(value: str) -> str:
+    text = html.unescape(html.unescape(value or ""))
+    text = re.sub(r"<\s*br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</\s*(?:p|div|h[1-6]|li|tr|ul|ol)\s*>", "\n", text, flags=re.I)
+    text = re.sub(r"<\s*li[^>]*>", "\n- ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def _heading(line: str) -> str:
+    return _norm(line).lstrip("- ").strip().rstrip(":").strip()
+
+
+def _is_about_line(line: str) -> bool:
+    label = _heading(line)
+    return bool(_ABOUT_HEADING.match(label) or _GLUED_ABOUT.match(label) or _NAMED_ABOUT.match(label))
+
+
+def _is_job_line(line: str) -> bool:
+    label = _heading(line)
+    stripped = _norm(line.strip())
+    return bool(_JOB_HEADING.match(label) or _ROLE_START.match(stripped) or _GLUED_JOB.match(stripped))
+
+
+def _split_plain(text: str) -> tuple[str, str]:
+    """Separate a company intro from the role when the posting marks the change."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return "", ""
+    about_at = [index for index, line in enumerate(lines) if _is_about_line(line)]
+    job_at = next((index for index, line in enumerate(lines) if _is_job_line(line)), None)
+    consumed: set[int] = set()
+    about_chunks: list[str] = []
+
+    for start in about_at:
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            if index != start and (_is_job_line(lines[index]) or _is_about_line(lines[index])):
+                end = index
+                break
+        consumed.update(range(start, end))
+        about_chunks.append("\n".join(lines[start:end]).strip())
+
+    if job_at and job_at > 0:
+        prefix = "\n".join(lines[:job_at]).strip()
+        folded = _norm(prefix)
+        if len(prefix) >= 60 and not _ALREADY_ROLE.match(folded) and _COMPANYISH.search(folded):
+            consumed.update(range(job_at))
+            if not any(index < job_at for index in about_at):
+                about_chunks.insert(0, prefix)
+
+    about = "\n\n".join(chunk for chunk in about_chunks if chunk)
+    role = "\n".join(line for index, line in enumerate(lines) if index not in consumed).strip()
+    if not about or not role:
+        return "", text.strip()
+    return about, role
+
+
+def split_description(body: str, *job_sections: str) -> tuple[str, str]:
+    """Split a posting into about-company text and the job description."""
+    raw = html.unescape(html.unescape(body or ""))
+    intro_html = ""
+    match = _INTRO_DIV.search(raw)
+    if match:
+        intro_html = match.group(1)
+        raw = raw[: match.start()] + raw[match.end() :]
+    intro = _html_lines(intro_html)
+    rest = _html_lines(raw)
+    about, role = _split_plain(rest)
+    if intro:
+        about = "\n\n".join(part for part in (intro, about) if part)
+        if not role:
+            role = rest
+    sections = [_html_lines(part) for part in job_sections if part and str(part).strip()]
+    narrative_is_company = (
+        not about
+        and rest
+        and not any(_is_job_line(line) for line in rest.splitlines())
+        and _COMPANYISH.search(_norm(rest))
+        and not _ALREADY_ROLE.match(_norm(rest))
+    )
+    if sections and narrative_is_company:
+        about, role = rest, ""
+    if sections:
+        role = "\n\n".join(part for part in (role, *sections) if part)
+    if about and not role:
+        role, about = about, ""
+    return about.strip(), role.strip()
 
 
 def format_skills(values) -> str:
@@ -421,26 +596,51 @@ def _error_detail(raw: bytes) -> str:
 def fetch_greenhouse_board(board: str, client: ApiClient | None = None) -> dict:
     if not valid_token(board):
         raise ValueError(f"invalid Greenhouse board token: {board}")
-    http = client or get_client()
-    return http.get_json(GREENHOUSE_JOBS_URL.format(board=board), retries=1)
+    http = client or get_board_client()
+    return http.get_json(GREENHOUSE_JOBS_URL.format(board=board), retries=3)
 
 
 def fetch_greenhouse_job(board: str, job_id: int | str, client: ApiClient | None = None) -> dict:
     if not valid_token(board) or not str(job_id).isdigit():
         raise ValueError(f"invalid Greenhouse job: {board}/{job_id}")
-    http = client or get_client()
-    return http.get_json(GREENHOUSE_JOB_URL.format(board=board, job_id=job_id))
+    http = client or get_board_client()
+    return http.get_json(GREENHOUSE_JOB_URL.format(board=board, job_id=job_id), retries=3)
 
 
-def fetch_lever_postings(site: str, limit: int = 50, client: ApiClient | None = None) -> list:
+def fetch_lever_postings(site: str, limit: int = 0, client: ApiClient | None = None) -> list:
+    """Every posting on the site. Lever pages in batches; limit only applies to a short CLI fetch."""
     if not valid_token(site):
         raise ValueError(f"invalid Lever site: {site}")
-    http = client or get_client()
-    payload = http.get_json(
-        LEVER_POSTINGS_URL.format(site=site),
-        params={"mode": "json", "limit": max(1, min(limit, 15))},
-        retries=1,
-    )
+    http = client or ApiClient(timeout=30)
+    if limit > 0:
+        return _lever_page(http, site, skip=0, limit=limit)
+    postings: list = []
+    seen: set[str] = set()
+    skip = 0
+    while skip < 5000:
+        page = _lever_page(http, site, skip=skip, limit=_LEVER_PAGE)
+        fresh = []
+        for item in page:
+            if not isinstance(item, dict):
+                continue
+            ident = str(item.get("id") or "")
+            if ident and ident in seen:
+                continue
+            if ident:
+                seen.add(ident)
+            fresh.append(item)
+        postings.extend(fresh)
+        if len(page) < _LEVER_PAGE or not fresh:
+            break
+        skip += len(page)
+    return postings
+
+
+def _lever_page(http: ApiClient, site: str, skip: int, limit: int) -> list:
+    params = {"mode": "json", "limit": max(1, min(limit, _LEVER_PAGE))}
+    if skip:
+        params["skip"] = skip
+    payload = http.get_json(LEVER_POSTINGS_URL.format(site=site), params=params, retries=3)
     if not isinstance(payload, list):
         raise ValueError(f"{site}: unexpected Lever response")
     return payload
@@ -449,16 +649,18 @@ def fetch_lever_postings(site: str, limit: int = 50, client: ApiClient | None = 
 def fetch_ashby_board(board: str, client: ApiClient | None = None) -> dict:
     if not valid_token(board):
         raise ValueError(f"invalid Ashby board: {board}")
-    http = client or get_client()
-    return http.get_json(ASHBY_BOARD_URL.format(board=board), retries=1)
+    http = client or get_board_client()
+    return http.get_json(ASHBY_BOARD_URL.format(board=board), retries=3)
 
 
-def fetch_remotive_jobs(query: str = "", limit: int = 20, client: ApiClient | None = None) -> dict:
+def fetch_remotive_jobs(query: str = "", limit: int = 0, client: ApiClient | None = None) -> dict:
     http = client or get_client()
-    return http.get_json(
-        REMOTIVE_JOBS_URL,
-        params={"search": query, "limit": min(max(limit, 1), 50)},
-    )
+    params: dict = {}
+    if query:
+        params["search"] = query
+    if limit > 0:
+        params["limit"] = limit
+    return http.get_json(REMOTIVE_JOBS_URL, params=params or None)
 
 
 def fetch_remoteok_jobs(client: ApiClient | None = None) -> list:
@@ -494,7 +696,7 @@ def fetch_adzuna_jobs(
         params={
             "app_id": app_id,
             "app_key": app_key,
-            "results_per_page": max(1, min(limit, 50)),
+            "results_per_page": max(1, min(limit, 50) if limit > 0 else 50),
             "what": query,
             "where": where,
             "content-type": "application/json",

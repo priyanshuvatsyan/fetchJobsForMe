@@ -1,3 +1,8 @@
 __pycache__/
 *.py[cod]
 backend/.cache/
+backend/data/
+.env
+.env.*
+!.env.example
+**/*service-account*.json
