@@ -8,6 +8,7 @@ from Server.api import (
     fetch_adzuna_jobs,
     job_profile,
     money_span,
+    split_description,
     select_jobs,
     to_datetime,
 )
@@ -51,6 +52,7 @@ class Adzuna:
             title = clean(item.get("title"))
             body = item.get("description") or ""
             experience, skill = job_profile(title, body)
+            about_company, job_description = split_description(body)
             currency = clean(item.get("salary_currency") or "USD")
             symbol = {"USD": "$", "GBP": "£", "EUR": "€", "INR": "₹", "CAD": "$", "AUD": "$"}.get(currency, f"{currency} ")
             jobs.append(
@@ -64,6 +66,8 @@ class Adzuna:
                     experience=experience,
                     skill=skill,
                     salary=money_span(item.get("salary_min"), item.get("salary_max"), symbol),
+                    about_company=about_company,
+                    job_description=job_description,
                 )
             )
         return select_jobs(jobs, "", "", limit)

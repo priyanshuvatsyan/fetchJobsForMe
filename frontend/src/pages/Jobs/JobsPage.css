@@ -1,0 +1,96 @@
+.jobs-page {
+  /* Scoped tokens so this page does not collide with the login styles. */
+  --jb-bg: #06080c;
+  --jb-surface-2: #11141c;
+  --jb-surface-2-raised: #141826;
+  --jb-surface-3: #1b1f2b;
+  --jb-surface-4: #232839;
+  --jb-border: #262a36;
+  --jb-border-strong: #39405270;
+  --jb-text: #f8fafc;
+  --jb-text-muted: #9aa6b8;
+  --jb-text-faint: #64748b;
+  --jb-accent: #7c3aed;
+  --jb-accent-hover: #8b5cf6;
+  --jb-accent-soft: #c4b5fd;
+  --jb-radius: 14px;
+
+  min-height: 100vh;
+  padding: 36px 24px 64px;
+  background: var(--jb-bg);
+  color: var(--jb-text);
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+.jobs-page-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  max-width: 980px;
+  margin: 0 auto;
+}
+
+.jobs-page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.jobs-page-kicker {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--jb-accent-soft);
+}
+
+.jobs-page-title {
+  margin: 6px 0 0;
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.jobs-page-subtitle {
+  margin: 6px 0 0;
+  max-width: 560px;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--jb-text-muted);
+}
+
+.jobs-page-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.jobs-page-count {
+  font-size: 13px;
+  color: var(--jb-text-muted);
+  white-space: nowrap;
+}
+
+.jobs-page-credits {
+  margin-top: 8px;
+  padding-top: 16px;
+  border-top: 1px solid var(--jb-border);
+}
+
+.jobs-page-credits p {
+  margin: 0 0 4px;
+  font-size: 12px;
+  color: var(--jb-text-faint);
+}
+
+@media (max-width: 620px) {
+  .jobs-page {
+    padding: 24px 16px 48px;
+  }
+
+  .jobs-page-header {
+    flex-direction: column;
+  }
+}
