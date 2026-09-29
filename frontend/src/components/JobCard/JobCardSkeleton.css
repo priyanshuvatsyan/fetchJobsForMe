@@ -1,0 +1,68 @@
+.job-card-skeleton {
+  display: flex;
+  gap: 14px;
+  padding: 18px;
+  background: var(--jb-surface-2);
+  border: 1px solid var(--jb-border);
+  border-radius: var(--jb-radius);
+}
+
+.skeleton-avatar {
+  width: 46px;
+  height: 46px;
+  border-radius: 12px;
+  flex-shrink: 0;
+}
+
+.skeleton-lines {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.skeleton-line {
+  height: 12px;
+  border-radius: 6px;
+}
+
+.skeleton-line-title {
+  width: 42%;
+  height: 16px;
+}
+
+.skeleton-line-company {
+  width: 28%;
+}
+
+.skeleton-line-meta {
+  width: 62%;
+}
+
+.skeleton-avatar,
+.skeleton-line {
+  background: linear-gradient(
+    90deg,
+    var(--jb-surface-3) 25%,
+    var(--jb-surface-4) 50%,
+    var(--jb-surface-3) 75%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes skeleton-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-avatar,
+  .skeleton-line {
+    animation: none;
+  }
+}
