@@ -4,4 +4,5 @@ backend/.cache/
 .env
 .env.*
 !.env.example
-**/*service-account*.json
+
+backend/secrets/firebase-service-account.json
