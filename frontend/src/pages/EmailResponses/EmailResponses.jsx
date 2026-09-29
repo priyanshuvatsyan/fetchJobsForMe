@@ -1,0 +1,5 @@
+import WorkspacePage from '../../components/WorkspacePage'
+
+export default function EmailResponses() {
+  return <WorkspacePage eyebrow="INBOX WORKSPACE" title="Email & Responses" description="Keep recruiter conversations and interview activity organized in one place." metrics={[{ label: 'Unread', value: '0' }, { label: 'Interview invites', value: '0' }, { label: 'Awaiting reply', value: '0' }, { label: 'Connected inboxes', value: '0' }]} sections={[{ title: 'Recent messages', description: 'Messages linked to your job search.', emptyMessage: 'Connect an inbox to see recruiter messages and interview updates here.' }, { title: 'Response queue', items: [{ title: 'Needs a reply', detail: 'Messages requiring your attention' }, { title: 'Interview scheduling', detail: 'Coordinate upcoming conversations' }, { title: 'Follow-ups', detail: 'Keep active applications moving' }] }]} />
+}

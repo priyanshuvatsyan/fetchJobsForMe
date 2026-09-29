@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   GoogleAuthProvider,
   sendPasswordResetEmail,
@@ -9,9 +10,9 @@ import { auth } from '../../firebase';
 import './Login.css';
 
 const Login = () => {
+  const navigate = useNavigate();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [activeTab, setActiveTab] = useState('login');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [feedback, setFeedback] = useState(null);
 
@@ -23,6 +24,7 @@ const Login = () => {
     try {
       const result = await signInWithEmailAndPassword(auth, email.trim(), password);
       setFeedback({ type: 'success', message: `Signed in as ${result.user.email}.` });
+      navigate('/dashboard');
     } catch (error) {
       setFeedback({
         type: 'error',
@@ -57,6 +59,7 @@ const Login = () => {
     try {
       const result = await signInWithPopup(auth, new GoogleAuthProvider());
       setFeedback({ type: 'success', message: `Signed in as ${result.user.email}.` });
+      navigate('/dashboard');
     } catch {
       setFeedback({ type: 'error', message: 'Google sign-in failed. Please try again.' });
     } finally {
@@ -196,7 +199,12 @@ const Login = () => {
                   </button>
                 </div>
                 <div className="input-wrapper">
-                  <span className="input-icon">🔑</span>
+                  <span className="input-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <circle cx="8" cy="15" r="4" />
+                      <path d="m10.85 12.15 8.65-8.65 2 2-2 2 1.5 1.5-2 2-1.5-1.5-3.8 3.8" />
+                    </svg>
+                  </span>
                   <input
                     type="password"
                     id="password"
