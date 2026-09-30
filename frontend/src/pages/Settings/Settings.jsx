@@ -1,0 +1,5 @@
+import WorkspacePage from '../../components/WorkspacePage'
+
+export default function Settings() {
+  return <WorkspacePage eyebrow="WORKSPACE PREFERENCES" title="Settings" description="Manage account preferences, connected services, and agent behavior." metrics={[{ label: 'Account', value: 'Not connected' }, { label: 'Integrations', value: '0' }, { label: 'Notifications', value: 'On' }, { label: 'Agent schedule', value: 'Default' }]} sections={[{ title: 'Connected services', description: 'Manage linked accounts and job sources.', emptyMessage: 'No additional services are connected yet.' }, { title: 'Preferences', items: [{ title: 'Job alerts', detail: 'Choose when and where notifications arrive' }, { title: 'Search schedule', detail: 'Control how often sources are checked' }, { title: 'Account security', detail: 'Review sign-in and access settings' }] }]} />
+}

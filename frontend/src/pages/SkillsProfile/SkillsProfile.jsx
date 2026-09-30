@@ -1,0 +1,5 @@
+import WorkspacePage from '../../components/WorkspacePage'
+
+export default function SkillsProfile() {
+  return <WorkspacePage eyebrow="YOUR CAREER PROFILE" title="Skills & Profile" description="Shape the information JobPilot uses to find and rank relevant roles." metrics={[{ label: 'Profile completion', value: '0%' }, { label: 'Skills', value: '0' }, { label: 'Target roles', value: '0' }, { label: 'Locations', value: '0' }]} sections={[{ title: 'Professional profile', description: 'Your job search preferences.', emptyMessage: 'Add your experience and preferences to personalize job discovery.' }, { title: 'Profile essentials', items: [{ title: 'Target roles', detail: 'Job titles and seniority' }, { title: 'Preferred locations', detail: 'Cities, regions, or remote' }, { title: 'Skills and experience', detail: 'Core skills, tools, and years of experience' }] }]} />
+}

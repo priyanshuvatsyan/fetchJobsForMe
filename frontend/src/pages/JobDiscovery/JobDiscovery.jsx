@@ -1,0 +1,5 @@
+import WorkspacePage from '../../components/WorkspacePage'
+
+export default function JobDiscovery() {
+  return <WorkspacePage eyebrow="FIND YOUR NEXT ROLE" title="Job Discovery" description="Search roles across your connected job sources and keep promising opportunities close." metrics={[{ label: 'Sources connected', value: '6' }, { label: 'New today', value: '0' }, { label: 'Searches saved', value: '0' }, { label: 'Last search', value: 'Not run' }]} sections={[{ title: 'Search jobs', description: 'Your search results will appear here.', emptyMessage: 'No search results yet. Add a role or keyword to start discovering jobs.' }, { title: 'Connected sources', items: [{ title: 'Greenhouse, Lever & Ashby', detail: 'Company job boards' }, { title: 'RemoteOK, Remotive & Arbeitnow', detail: 'Remote job sources' }, { title: 'Adzuna', detail: 'Aggregated job listings' }] }]} />
+}

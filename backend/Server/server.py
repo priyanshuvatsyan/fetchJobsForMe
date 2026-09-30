@@ -25,7 +25,7 @@ BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-from Server.api import Job, within_days
+from Server.api import Job, is_tech_role, within_days
 from connectors.Adzuna import Adzuna
 from connectors.Arbeitnow import Arbeitnow
 from connectors.Ashby import Ashby
@@ -33,7 +33,7 @@ from connectors.Greenhouse import Greenhouse
 from connectors.Lever import Lever
 from connectors.RemoteOK import RemoteOK
 from connectors.Remotive import Remotive
-from connectors.webScrapping import LinkedIn
+from connectors.LinkedIn import LinkedIn
 
 SLUG_SOURCES = {"greenhouse", "lever", "ashby"}
 CONNECTORS = [
@@ -154,6 +154,7 @@ def run_connector(
     def on_batch(batch: list[Job]) -> None:
         nonlocal streamed
         streamed = True
+        batch = [job for job in batch if is_tech_role(job.title)]
         if publish is not None and batch:
             publish(connector, batch)
 
@@ -163,14 +164,15 @@ def run_connector(
         "limit": limit,
         "boards": site_boards,
     }
-    if posted_within_days and cls.key in SLUG_SOURCES:
+    if posted_within_days and (cls.key in SLUG_SOURCES or cls.key == "linkedin"):
         kwargs["posted_within_days"] = posted_within_days
-    if publish is not None and cls.key in SLUG_SOURCES:
+    if publish is not None and (cls.key in SLUG_SOURCES or cls.key == "linkedin"):
         kwargs["on_batch"] = on_batch
     if cls.key == "linkedin":
         jobs = connector.fetch(**kwargs, open_browser=open_browser)
     else:
         jobs = connector.fetch(**kwargs)
+    jobs = [job for job in jobs if is_tech_role(job.title)]
     if posted_within_days:
         jobs = [job for job in jobs if within_days(job.posted_at, posted_within_days)]
     if publish is not None:
@@ -485,10 +487,21 @@ def read_jobs_file() -> dict | None:
 
 
 def write_jobs_file(payload: dict) -> None:
+    """OneDrive or an editor can lock the file for a moment. Retry, and never fail a fetch over it."""
     JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
     temporary = JOBS_FILE.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(JOBS_FILE)
+    body = json.dumps(payload, ensure_ascii=False)
+    for attempt in range(5):
+        try:
+            temporary.write_text(body, encoding="utf-8")
+            temporary.replace(JOBS_FILE)
+            return
+        except OSError:
+            time.sleep(0.3 * (attempt + 1))
+    try:
+        JOBS_FILE.write_text(body, encoding="utf-8")
+    except OSError as exc:
+        print(f"  could not save {JOBS_FILE.name}: {exc}")
 
 
 def jobs_payload(
@@ -545,8 +558,15 @@ def jobs_payload(
     }
 
 
+SNAPSHOT_VERSION = 2
+
+
 def _snapshot_current(saved: dict) -> bool:
-    return saved.get("windowDays") == WINDOW_DAYS and not saved.get("loading")
+    return (
+        saved.get("windowDays") == WINDOW_DAYS
+        and saved.get("version") == SNAPSHOT_VERSION
+        and not saved.get("loading")
+    )
 
 
 def _portal_list() -> list[dict]:
@@ -567,6 +587,7 @@ def _payload_from_progress(loading: bool, cached: bool = False) -> dict:
         "notes": list(_progress["notes"]),
         "linkedinSearchUrl": _progress["linkedin"],
         "windowDays": WINDOW_DAYS,
+        "version": SNAPSHOT_VERSION,
         "loading": loading,
         "cached": cached,
         "fetchedAt": "" if loading else _progress["fetchedAt"],
@@ -620,10 +641,60 @@ def _finish_fetch(generation: int, error: str = "") -> None:
         write_jobs_file(payload)
 
 
+def _portal_sources() -> list[type]:
+    """Greenhouse, Lever, and the other shared-file portals. LinkedIn writes its own file."""
+    return [cls for cls in CONNECTORS if cls.key != "linkedin"]
+
+
+_linkedin_lock = threading.Lock()
+_linkedin_running = False
+LINKEDIN_FILE = Path(__file__).resolve().parents[1] / "data" / "linkedin_jobs.json"
+
+
+def read_linkedin_jobs() -> list:
+    try:
+        payload = json.loads(LINKEDIN_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [job for job in payload if isinstance(job, dict) and is_tech_role(job.get("role", ""))]
+
+
+def _linkedin_worker() -> None:
+    global _linkedin_running
+    try:
+        LinkedIn().fetch(limit=0, open_browser=False, posted_within_days=WINDOW_DAYS)
+    except Exception as exc:
+        print(f"LinkedIn fetch failed: {exc}")
+    finally:
+        with _linkedin_lock:
+            _linkedin_running = False
+
+
+def start_linkedin(refresh: bool) -> None:
+    """Fetch LinkedIn into its own file while the other portals write jobs.json."""
+    global _linkedin_running
+    with _linkedin_lock:
+        if _linkedin_running:
+            return
+        if not refresh and read_linkedin_jobs():
+            return
+        _linkedin_running = True
+        threading.Thread(target=_linkedin_worker, name="linkedin-fetch", daemon=True).start()
+
+
+def linkedin_payload() -> dict:
+    with _linkedin_lock:
+        loading = _linkedin_running
+    jobs = read_linkedin_jobs()
+    return {"jobs": jobs, "count": len(jobs), "loading": loading}
+
+
 def _fetch_worker(country: str, generation: int) -> None:
     try:
         run_sources(
-            list(CONNECTORS),
+            _portal_sources(),
             query="",
             where="",
             limit=0,
@@ -655,6 +726,7 @@ def _reset_progress() -> None:
 
 def saved_or_live_jobs(country: str, refresh: bool) -> dict:
     """Return the saved file when it is complete. A new fetch returns jobs as each company comes in."""
+    start_linkedin(refresh)
     with _jobs_lock:
         if _progress["running"] and not refresh:
             return _payload_from_progress(loading=True)
@@ -696,6 +768,12 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             return
         if route.path == "/api/portals":
             self._send_json(200, {"portals": [{"key": cls.key, "label": cls.label} for cls in CONNECTORS]})
+            return
+        if route.path == "/api/linkedin":
+            first = lambda name, fallback="": (params.get(name) or [fallback])[0].strip()  # noqa: E731
+            refresh = first("refresh", "").casefold() in {"1", "true", "yes"}
+            start_linkedin(refresh)
+            self._send_json(200, linkedin_payload())
             return
         if route.path != "/api/jobs":
             self._send_json(404, {"error": f"unknown path {route.path}"})

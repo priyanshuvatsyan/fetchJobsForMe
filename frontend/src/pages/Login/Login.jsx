@@ -1,14 +1,70 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import {
+  GoogleAuthProvider,
+  sendPasswordResetEmail,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+} from 'firebase/auth';
+import { auth } from '../../firebase';
 import './Login.css';
 
 const Login = () => {
+  const navigate = useNavigate();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [activeTab, setActiveTab] = useState('login');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [feedback, setFeedback] = useState(null);
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
-    console.log('Logging in with:', { email, password });
+    setFeedback(null);
+    setIsSubmitting(true);
+
+    try {
+      const result = await signInWithEmailAndPassword(auth, email.trim(), password);
+      setFeedback({ type: 'success', message: `Signed in as ${result.user.email}.` });
+      navigate('/dashboard');
+    } catch (error) {
+      setFeedback({
+        type: 'error',
+        message: error.code === 'auth/too-many-requests'
+          ? 'Too many attempts. Try again later.'
+          : 'Unable to sign in. Check your email and password, then try again.',
+      });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handlePasswordReset = async () => {
+    const normalizedEmail = email.trim();
+    if (!normalizedEmail) {
+      setFeedback({ type: 'error', message: 'Enter your email address first.' });
+      return;
+    }
+
+    setFeedback(null);
+    try {
+      await sendPasswordResetEmail(auth, normalizedEmail);
+      setFeedback({ type: 'success', message: 'Password reset email sent.' });
+    } catch {
+      setFeedback({ type: 'error', message: 'Unable to send a reset email. Check the address and try again.' });
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    setFeedback(null);
+    setIsSubmitting(true);
+    try {
+      const result = await signInWithPopup(auth, new GoogleAuthProvider());
+      setFeedback({ type: 'success', message: `Signed in as ${result.user.email}.` });
+      navigate('/dashboard');
+    } catch {
+      setFeedback({ type: 'error', message: 'Google sign-in failed. Please try again.' });
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -100,11 +156,11 @@ const Login = () => {
                   <path d="M20 7L12 3L4 7M20 7L12 11M20 7V17L12 21M12 11L4 7M12 11V21M4 7V17L12 21" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
                 </svg>
               </div>
-              <h2>Welcome Back</h2>
+              <h2>Greetings Master</h2>
               <p>Sign in to access your agent dashboard</p>
             </div>
 
-            <div className="tabs">
+            {/* <div className="tabs">
               <button 
                 className={`tab ${activeTab === 'login' ? 'active' : ''}`}
                 onClick={() => setActiveTab('login')}
@@ -117,7 +173,7 @@ const Login = () => {
               >
                 SSO Login
               </button>
-            </div>
+            </div> */}
 
             <form onSubmit={handleSubmit} className="login-form">
               <div className="form-group slide-up-1">
@@ -127,7 +183,7 @@ const Login = () => {
                   <input
                     type="email"
                     id="email"
-                    placeholder="priyanshu@example.com"
+                    placeholder="email@example.com"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     required
@@ -138,10 +194,17 @@ const Login = () => {
               <div className="form-group slide-up-2">
                 <div className="password-header">
                   <label htmlFor="password">Password</label>
-                  <a href="#" className="forgot-password">Forgot password?</a>
+                  <button type="button" className="forgot-password" onClick={handlePasswordReset}>
+                    Forgot password?
+                  </button>
                 </div>
                 <div className="input-wrapper">
-                  <span className="input-icon">🔑</span>
+                  <span className="input-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <circle cx="8" cy="15" r="4" />
+                      <path d="m10.85 12.15 8.65-8.65 2 2-2 2 1.5 1.5-2 2-1.5-1.5-3.8 3.8" />
+                    </svg>
+                  </span>
                   <input
                     type="password"
                     id="password"
@@ -153,8 +216,14 @@ const Login = () => {
                 </div>
               </div>
 
-              <button type="submit" className="btn-primary slide-up-3">
-                Authenticate
+              {feedback && (
+                <p className={`auth-feedback ${feedback.type}`} role={feedback.type === 'error' ? 'alert' : 'status'}>
+                  {feedback.message}
+                </p>
+              )}
+
+              <button type="submit" className="btn-primary slide-up-3" disabled={isSubmitting}>
+                {isSubmitting ? 'Signing in...' : 'Authenticate'}
                 <span className="btn-arrow">→</span>
               </button>
             </form>
@@ -164,12 +233,12 @@ const Login = () => {
             </div>
 
             <div className="social-logins slide-up-4">
-              <button className="btn-icon" type="button" title="LinkedIn">
+              {/* <button className="btn-icon" type="button" title="LinkedIn sign-in is not configured" disabled>
                 <svg viewBox="0 0 24 24" fill="currentColor">
                   <path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z"/>
                 </svg>
-              </button>
-              <button className="btn-icon" type="button" title="Google">
+              </button> */}
+              <button className="btn-icon" type="button" title="Continue with Google" onClick={handleGoogleSignIn} disabled={isSubmitting}>
                 <svg viewBox="0 0 24 24" fill="currentColor">
                   <path d="M12.48 10.92v3.28h7.84c-.24 1.84-.853 3.187-1.787 4.133-1.147 1.147-2.933 2.4-6.053 2.4-4.827 0-8.6-3.893-8.6-8.72s3.773-8.72 8.6-8.72c2.6 0 4.507 1.027 5.907 2.347l2.307-2.307C18.747 1.44 16.133 0 12.48 0 5.867 0 .307 5.387.307 12s5.56 12 12.173 12c3.573 0 6.267-1.173 8.373-3.36 2.16-2.16 2.84-5.213 2.84-7.667 0-.76-.053-1.467-.173-2.053H12.48z"/>
                 </svg>

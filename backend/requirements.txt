@@ -1,2 +1,4 @@
 firebase-admin
 python-dotenv
+requests
+beautifulsoup4

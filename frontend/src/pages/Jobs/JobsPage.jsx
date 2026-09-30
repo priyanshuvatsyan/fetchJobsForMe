@@ -33,7 +33,7 @@ const JobsPage = () => {
   const hiddenByDate = jobs.length - visibleJobs.length
 
   return (
-    <main className="jobs-page">
+    <div className="jobs-page">
       <div className="jobs-page-inner">
         <header className="jobs-page-header">
           <div>
@@ -128,7 +128,7 @@ const JobsPage = () => {
           </footer>
         ) : null}
       </div>
-    </main>
+    </div>
   )
 }
 
