@@ -119,6 +119,44 @@
 .logout-button:hover { color: #f38b91; background: #211419; border-color: #42232b; }
 .logout-error { margin: 12px 0 0; color: #f38b91; font-size: 10px; line-height: 1.4; }
 
+.theme-toggle {
+  width: 100%;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 0 9px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: #a6b0c0;
+  text-align: left;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.theme-toggle svg { width: 16px; height: 16px; }
+.theme-toggle:hover { color: #e7eaf1; background: #121722; border-color: #252c39; }
+.side-nav > .theme-toggle { width: auto; min-height: 31px; justify-content: flex-start; margin: -14px 4px 12px; }
+
+.app-root[data-theme='light'] .side-nav { background: #ffffff; border-color: #dce2eb; color: #627087; }
+.app-root[data-theme='light'] .brand-lockup { color: #192235; }
+.app-root[data-theme='light'] .brand-copy small { color: #6454d8; }
+.app-root[data-theme='light'] .nav-link { color: #617087; }
+.app-root[data-theme='light'] .nav-link:hover { color: #243047; background: #f0f2f8; }
+.app-root[data-theme='light'] .nav-link.active { color: #3b347b; background: #eeecff; border-color: #d9d4ff; }
+.app-root[data-theme='light'] .nav-link.active svg { color: #6758df; }
+.app-root[data-theme='light'] .agent-status { background: #eaf8f2; border-color: #77d3af; }
+.app-root[data-theme='light'] .agent-status p { color: #587468; }
+.app-root[data-theme='light'] .application-usage > div:first-child { color: #68758b; }
+.app-root[data-theme='light'] .application-usage strong { color: #27344c; }
+.app-root[data-theme='light'] .usage-track { background: #e3e7ef; }
+.app-root[data-theme='light'] .theme-toggle { color: #5e6c83; }
+.app-root[data-theme='light'] .theme-toggle:hover { color: #29354c; background: #f0f2f8; border-color: #dfe4ec; }
+.app-root[data-theme='light'] .logout-button { color: #647189; }
+.app-root[data-theme='light'] .logout-button:hover { color: #bd3d4b; background: #fff0f1; border-color: #f6d6d9; }
+
 @media (max-width: 760px) {
   .side-nav {
     width: 100%;
@@ -129,6 +167,7 @@
   }
 
   .brand-lockup { margin: 0 4px 13px; }
+  .side-nav > .theme-toggle { margin: -7px 4px 9px; }
   .nav-links { display: flex; gap: 5px; overflow-x: auto; padding-bottom: 3px; }
   .nav-link { min-width: max-content; min-height: 36px; padding: 0 9px; }
   .nav-footer { display: block; margin-top: 12px; }

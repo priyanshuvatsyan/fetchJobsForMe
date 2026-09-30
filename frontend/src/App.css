@@ -20,6 +20,25 @@
 	font-size: 13px;
 }
 
+.app-root {
+	min-height: 100vh;
+	background: #090c12;
+}
+
+.app-root[data-theme='light'] {
+	background: #f4f6fa;
+}
+
+.app-root[data-theme='light'] .app-shell {
+	background: #f4f6fa;
+	color: #202b40;
+}
+
+.app-root[data-theme='light'] .session-check {
+	color: #59677e;
+	background: #f4f6fa;
+}
+
 @media (max-width: 760px) {
 	.app-shell {
 		display: block;

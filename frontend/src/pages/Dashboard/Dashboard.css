@@ -142,6 +142,53 @@
 .loading-ring { width: 11px; height: 11px; flex: 0 0 11px; border: 1px solid #8992a4; border-right-color: transparent; border-radius: 50%; animation: dashboard-spin 1s linear infinite; }
 .preview-note { margin: 13px 0 0; color: #758196; font-size: 9px; text-align: right; }
 
+.app-root[data-theme='light'] .dashboard-page { background: #f4f6fa; color: #202b40; }
+.app-root[data-theme='light'] .dashboard-topbar { background: #fff; border-color: #dce2eb; }
+.app-root[data-theme='light'] .global-search { color: #76839a; background: #f7f8fb; border-color: #dce2eb; }
+.app-root[data-theme='light'] .global-search input { color: #28354c; }
+.app-root[data-theme='light'] .global-search input::placeholder,
+.app-root[data-theme='light'] .global-search kbd { color: #7e8ba0; }
+.app-root[data-theme='light'] .notification-button { color: #617087; border-color: #dce2eb; }
+.app-root[data-theme='light'] .user-chip strong { color: #253149; }
+.app-root[data-theme='light'] .user-chip small { color: #718097; }
+.app-root[data-theme='light'] .user-chip > span { color: #5144ad; background: #eeecff; border-color: #d9d4ff; }
+.app-root[data-theme='light'] .dashboard-welcome h1 { color: #202b40; }
+.app-root[data-theme='light'] .dashboard-welcome p { color: #66748a; }
+.app-root[data-theme='light'] .metric-tile { background: #fff; border-color: #dce2eb; }
+.app-root[data-theme='light'] .metric-label { color: #66748a; }
+.app-root[data-theme='light'] .metric-tile > strong { color: #202b40; }
+.app-root[data-theme='light'] .dashboard-section-heading h2 { color: #26334a; }
+.app-root[data-theme='light'] .dashboard-section-heading p { color: #718097; }
+.app-root[data-theme='light'] .job-card { background: #fff; border-color: #dce2eb; }
+.app-root[data-theme='light'] .job-card:hover,
+.app-root[data-theme='light'] .job-card.selected { background: #fbfbff; border-color: #c9c3f3; }
+.app-root[data-theme='light'] .job-title-line h3,
+.app-root[data-theme='light'] .job-company { color: #253149; }
+.app-root[data-theme='light'] .job-details,
+.app-root[data-theme='light'] .job-card-footer,
+.app-root[data-theme='light'] .preview-note { color: #718097; }
+.app-root[data-theme='light'] .job-tags span { color: #46546b; background: #f2f4f8; border-color: #dfe4ec; }
+.app-root[data-theme='light'] .job-tags span.missing { color: #875d0a; background: #fff6df; border-color: #eed89f; }
+.app-root[data-theme='light'] .job-card-footer { border-color: #e2e6ed; }
+.app-root[data-theme='light'] .job-card-footer a { color: #46546b; border-color: #d6dce6; }
+.app-root[data-theme='light'] .match-insight { background: linear-gradient(155deg, #f0eeff 0%, #f8f7ff 78%); border-color: #c8c0f4; }
+.app-root[data-theme='light'] .insight-heading h2 { color: #2b3150; }
+.app-root[data-theme='light'] .insight-heading small { color: #6152c2; }
+.app-root[data-theme='light'] .match-insight > p,
+.app-root[data-theme='light'] .match-insight li { color: #4f5b73; }
+.app-root[data-theme='light'] .insight-warning { color: #785509; background: #fff6df; border-color: #eed89f; }
+.app-root[data-theme='light'] .activity-panel,
+.app-root[data-theme='light'] .approval-panel { background: #fff; border-color: #dce2eb; }
+.app-root[data-theme='light'] .activity-row,
+.app-root[data-theme='light'] .queue-item { border-color: #e4e8ef; }
+.app-root[data-theme='light'] .activity-row time,
+.app-root[data-theme='light'] .activity-row small,
+.app-root[data-theme='light'] .queue-item small { color: #718097; }
+.app-root[data-theme='light'] .activity-row strong,
+.app-root[data-theme='light'] .queue-item strong { color: #344158; }
+.app-root[data-theme='light'] .queue-count { color: #825c13; background: #fff2cf; }
+.app-root[data-theme='light'] .no-results { color: #66748a; border-color: #cfd7e3; }
+
 @keyframes dashboard-spin { to { transform: rotate(360deg); } }
 
 @media (max-width: 1050px) {

@@ -46,6 +46,24 @@
 .section-empty p { max-width: 390px; margin: 0; font-size: 11px; line-height: 1.6; }
 .empty-mark { width: 25px; height: 25px; flex: 0 0 25px; display: grid; place-items: center; border: 1px solid #303849; border-radius: 7px; color: #919aaa; font-size: 17px; }
 
+.app-root[data-theme='light'] .page-heading { border-color: #dce2eb; }
+.app-root[data-theme='light'] .page-heading h1 { color: #202b40; }
+.app-root[data-theme='light'] .page-description,
+.app-root[data-theme='light'] .page-metric span,
+.app-root[data-theme='light'] .section-heading p,
+.app-root[data-theme='light'] .section-list p,
+.app-root[data-theme='light'] .section-empty { color: #68768c; }
+.app-root[data-theme='light'] .page-date,
+.app-root[data-theme='light'] .section-list small { color: #7b879a; }
+.app-root[data-theme='light'] .page-metrics { border-color: #dce2eb; background: #fff; }
+.app-root[data-theme='light'] .page-metric + .page-metric,
+.app-root[data-theme='light'] .page-section .section-heading,
+.app-root[data-theme='light'] .section-list li { border-color: #e2e6ed; }
+.app-root[data-theme='light'] .page-metric strong,
+.app-root[data-theme='light'] .section-heading h2,
+.app-root[data-theme='light'] .section-list strong { color: #27344a; }
+.app-root[data-theme='light'] .empty-mark { border-color: #d9dfe9; color: #637087; }
+
 @media (max-width: 900px) {
   .page-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .page-metric:nth-child(3) { border-left: 0; border-top: 1px solid #202632; }

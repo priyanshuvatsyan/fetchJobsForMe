@@ -33,10 +33,10 @@ function RequireAuth() {
   return user ? <Outlet /> : <Navigate to="/login" replace />
 }
 
-function AppLayout() {
+function AppLayout({ theme, onToggleTheme }) {
   return (
     <div className="app-shell">
-      <Nav />
+      <Nav theme={theme} onToggleTheme={onToggleTheme} />
       <main className="workspace-main">
         <Outlet />
       </main>
@@ -45,28 +45,40 @@ function AppLayout() {
 }
 
 function App() {
+  const [theme, setTheme] = useState(() => localStorage.getItem('fetchjobs-theme') || 'dark')
+
+  const toggleTheme = () => {
+    setTheme((currentTheme) => {
+      const nextTheme = currentTheme === 'dark' ? 'light' : 'dark'
+      localStorage.setItem('fetchjobs-theme', nextTheme)
+      return nextTheme
+    })
+  }
+
   return (
-    <BrowserRouter>
-      <Routes>
-        <Route path="/login" element={<Login />} />
-        <Route element={<AppLayout />}>
-          <Route path="jobs" element={<JobsPage />} />
-          <Route element={<RequireAuth />}>
-            <Route index element={<Navigate to="/dashboard" replace />} />
-            <Route path="dashboard" element={<Dashboard />} />
-            <Route path="job-discovery" element={<JobDiscovery />} />
-            <Route path="recommended-jobs" element={<RecommendedJobs />} />
-            <Route path="applications" element={<Applications />} />
-            <Route path="resume-analyzer" element={<ResumeAnalyzer />} />
-            <Route path="email-responses" element={<EmailResponses />} />
-            <Route path="skills-profile" element={<SkillsProfile />} />
-            <Route path="agent-activity" element={<AgentActivity />} />
-            <Route path="settings" element={<Settings />} />
+    <div className="app-root" data-theme={theme}>
+      <BrowserRouter>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route element={<AppLayout theme={theme} onToggleTheme={toggleTheme} />}>
+            <Route path="jobs" element={<JobsPage />} />
+            <Route element={<RequireAuth />}>
+              <Route index element={<Navigate to="/dashboard" replace />} />
+              <Route path="dashboard" element={<Dashboard />} />
+              <Route path="job-discovery" element={<JobDiscovery />} />
+              <Route path="recommended-jobs" element={<RecommendedJobs />} />
+              <Route path="applications" element={<Applications />} />
+              <Route path="resume-analyzer" element={<ResumeAnalyzer />} />
+              <Route path="email-responses" element={<EmailResponses />} />
+              <Route path="skills-profile" element={<SkillsProfile />} />
+              <Route path="agent-activity" element={<AgentActivity />} />
+              <Route path="settings" element={<Settings />} />
+            </Route>
           </Route>
-        </Route>
-        <Route path="*" element={<Navigate to="/login" replace />} />
-      </Routes>
-    </BrowserRouter>
+          <Route path="*" element={<Navigate to="/login" replace />} />
+        </Routes>
+      </BrowserRouter>
+    </div>
   )
 }
 
