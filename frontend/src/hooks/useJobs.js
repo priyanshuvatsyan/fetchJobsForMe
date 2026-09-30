@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { fetchJobs } from '../api/jobs'
+import { fetchJobs, fetchLinkedInJobs } from '../api/jobs'
 
 const EMPTY = {
   jobs: [],
@@ -34,11 +34,23 @@ export function useJobs() {
     setError(null)
 
     const pull = (isRefresh) => {
-      fetchJobs({ refresh: isRefresh }, controller.signal)
-        .then((result) => {
+      Promise.all([
+        fetchJobs({ refresh: isRefresh }, controller.signal),
+        fetchLinkedInJobs({ refresh: isRefresh }, controller.signal),
+      ])
+        .then(([result, linkedin]) => {
           if (gen !== generation.current || controller.signal.aborted) return
-          setData(result)
-          if (result.loading) {
+          const seen = new Set()
+          const jobs = []
+          for (const job of [...result.jobs, ...linkedin.jobs]) {
+            const key = job.link || job.id
+            if (seen.has(key)) continue
+            seen.add(key)
+            jobs.push(job)
+          }
+          const loading = result.loading || linkedin.loading
+          setData({ ...result, jobs, loading })
+          if (loading) {
             timer.current = setTimeout(() => pull(false), 1000)
             return
           }

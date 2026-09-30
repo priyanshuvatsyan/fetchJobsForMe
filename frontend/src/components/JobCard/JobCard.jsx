@@ -1,7 +1,7 @@
 import { useId, useState } from 'react'
 import Button from '../Button/Button'
 import JobDescription from '../JobDescription/JobDescription'
-import { formatPostedAt, initials, workMode } from '../../utils/jobs'
+import { formatPostedAt, formatPostedDateTime, initials, workMode } from '../../utils/jobs'
 import './JobCard.css'
 
 const PALETTE = [
@@ -66,6 +66,7 @@ const JobCard = ({ job, defaultExpanded = false }) => {
   const panelId = useId()
   const mode = workMode(job.location)
   const posted = formatPostedAt(job.postedAt)
+  const postedAt = formatPostedDateTime(job.postedAt)
   const hasDescription = Boolean(job.aboutCompany || job.jobDescription)
 
   const toggle = () => setExpanded((open) => !open)
@@ -125,7 +126,12 @@ const JobCard = ({ job, defaultExpanded = false }) => {
         {mode ? <Badge tone="info">{mode}</Badge> : null}
         {job.experience ? <Badge tone="neutral">{job.experience}</Badge> : null}
         {job.salary ? <Badge tone="success">{job.salary}</Badge> : null}
-        {posted ? <span className="job-card-posted">{posted}</span> : null}
+        {posted ? (
+          <span className="job-card-posted">
+            <span>{posted}</span>
+            {postedAt ? <time className="job-card-posted-at" dateTime={job.postedAt}>{postedAt}</time> : null}
+          </span>
+        ) : null}
       </div>
 
       {job.skills.length ? (

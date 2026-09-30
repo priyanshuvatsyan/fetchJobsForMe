@@ -1,1 +1,1 @@
-"""Job-source connectors. LinkedIn search lives in webScrapping."""
+"""Job-source connectors. LinkedIn lives in connectors/LinkedIn."""

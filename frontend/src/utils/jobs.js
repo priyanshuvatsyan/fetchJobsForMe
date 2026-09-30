@@ -77,6 +77,19 @@ export function formatPostedAt(value) {
   return months === 1 ? '1 month ago' : `${months} months ago`
 }
 
+/** Local date and time, for example "29 Sep 2026, 11:42 AM". */
+export function formatPostedDateTime(value) {
+  const date = parsePostedAt(value)
+  if (!date) return ''
+  return date.toLocaleString('en-IN', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+}
+
 function amount(token) {
   if (/^\d{1,3}(\.\d{3})+$/.test(token)) return Number(token.replace(/\./g, ''))
   if (/^\d{1,3}(,\d{3})+$/.test(token)) return Number(token.replace(/,/g, ''))

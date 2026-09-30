@@ -223,7 +223,50 @@ def company_from_slug(slug: str) -> str:
     return clean(slug).replace("-", " ").replace("_", " ").title()
 
 
+_TECH_ROLE = re.compile(
+    r"\b(?:"
+    r"software|developer|programmer|coder|full[\s-]?stack|front[\s-]?end|back[\s-]?end|"
+    r"web|mobile|android|ios|devops|devsecops|mlops|llmops|dataops|sre|site reliability|"
+    r"cloud|infrastructure|sysadmin|system administrator|systems? engineer|systems? analyst|"
+    r"network|cyber|cybersecurity|infosec|information security|application security|"
+    r"security engineer|security analyst|penetration|pentest|soc analyst|"
+    r"data|analytics|business intelligence|bi|etl|big data|"
+    r"machine learning|ml|ai|artificial intelligence|deep learning|nlp|computer vision|"
+    r"llm|gen\s?ai|generative|prompt engineer|"
+    r"automation|rpa|qa|quality assurance|sdet|tester|testing|test engineer|"
+    r"database|dba|sql|python|java|javascript|typescript|react|angular|node(?:\.?js)?|"
+    r"\.net|golang|rust|php|ruby|scala|kotlin|swift|salesforce|servicenow|sap|erp|"
+    r"blockchain|web3|embedded|firmware|game developer|ui developer|ux engineer|"
+    r"(?:software|solutions?|cloud|data|enterprise|technical|systems?|security|it) architect|"
+    r"tech lead|technical lead|cto|kubernetes|platform|"
+    r"application support|technical support|it support|helpdesk|help desk"
+    r")\b",
+    re.I,
+)
+_IT_WORD = re.compile(r"\bIT\b")
+_ENGINEER = re.compile(r"\bengineer(?:ing)?\b", re.I)
+_NOT_TECH = re.compile(
+    r"\b(?:civil|mechanical|chemical|structural|construction|hvac|plumbing|geotechnical|"
+    r"environmental|petroleum|mining|manufacturing|maintenance|field service|"
+    r"sales engineer|data entry|security guard|security officer|process engineer|"
+    r"electrical engineer|biomedical|agricultural|marine)\b",
+    re.I,
+)
+
+
+def is_tech_role(title: str) -> bool:
+    """Computer science and IT roles only. Uses the job title."""
+    text = clean(title)
+    if not text or _NOT_TECH.search(text):
+        return False
+    if _TECH_ROLE.search(text) or _IT_WORD.search(text):
+        return True
+    return bool(_ENGINEER.search(text))
+
+
 def job_matches(job: Job, query: str, where: str) -> bool:
+    if not is_tech_role(job.title):
+        return False
     haystack = f"{job.title} {job.company} {job.location}".casefold()
     if query and query.casefold() not in haystack:
         return False
