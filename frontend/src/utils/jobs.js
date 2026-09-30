@@ -87,6 +87,7 @@ export function formatPostedDateTime(value) {
     year: 'numeric',
     hour: 'numeric',
     minute: '2-digit',
+    hour12: true,
   })
 }
 
@@ -176,7 +177,8 @@ function includes(haystack, needle) {
 export function matchesJob(job, { query = '', where = '', source = 'all', boards = '' }) {
   const haystack = `${job.role} ${job.company} ${job.location}`
   if (!includes(haystack, query) || !includes(haystack, where)) return false
-  if (source !== 'all' && job.portal.toLowerCase() !== source.toLowerCase()) return false
+  const portalKey = (value) => value.toLowerCase().replace(/[^a-z0-9]/g, '')
+  if (source !== 'all' && portalKey(job.portal) !== portalKey(source)) return false
   const tokens = boards
     .split(',')
     .map((token) => token.trim().toLowerCase().replace(/[^a-z0-9]/g, ''))

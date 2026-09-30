@@ -17,6 +17,8 @@ from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from Server.control import cancelled, token
+
 USER_AGENT = "fetchJobsForMe/0.1 (personal job search; public APIs only)"
 # RemoteOK's public JSON API redirect-loops unless the client sends a browser User-Agent.
 BROWSER_USER_AGENT = (
@@ -185,6 +187,23 @@ def within_days(posted_at: str, days: int) -> bool:
     return datetime.now(timezone.utc) - moment <= timedelta(days=days)
 
 
+_GMT_OFFSET = re.compile(r"\sGMT([+-])(\d{2}):?(\d{2})?$", re.I)
+_COMPACT_OFFSET = re.compile(r"([+-])(\d{2})(\d{2})$")
+
+
+def _with_iso_offset(text: str) -> str:
+    """Turn 'GMT+0530' and '+0530' into an offset fromisoformat understands."""
+    gmt = _GMT_OFFSET.search(text)
+    if gmt:
+        sign, hours, minutes = gmt.group(1), gmt.group(2), gmt.group(3) or "00"
+        text = f"{text[: gmt.start()]}{sign}{hours}:{minutes}"
+    compact = _COMPACT_OFFSET.search(text)
+    if compact and (compact.start() == 0 or text[compact.start() - 1] != ":"):
+        sign, hours, minutes = compact.group(1), compact.group(2), compact.group(3)
+        text = f"{text[: compact.start()]}{sign}{hours}:{minutes}"
+    return text
+
+
 def to_datetime(value) -> str:
     """Portal create time as UTC 'YYYY-MM-DD HH:MM:SS'."""
     if value is None or value == "":
@@ -198,7 +217,7 @@ def to_datetime(value) -> str:
         except (OverflowError, OSError, ValueError):
             return ""
         return moment.strftime("%Y-%m-%d %H:%M:%S")
-    text = str(value).strip()
+    text = _with_iso_offset(str(value).strip())
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     try:
@@ -249,7 +268,8 @@ _NOT_TECH = re.compile(
     r"\b(?:civil|mechanical|chemical|structural|construction|hvac|plumbing|geotechnical|"
     r"environmental|petroleum|mining|manufacturing|maintenance|field service|"
     r"sales engineer|data entry|security guard|security officer|process engineer|"
-    r"electrical engineer|biomedical|agricultural|marine)\b",
+    r"electrical engineer|electronics engineer|production engineer|biomedical|"
+    r"agricultural|marine|non[- ]?it|recruiter|business development)\b",
     re.I,
 )
 
@@ -541,34 +561,38 @@ def load_boards(tokens: list[str], fetch, workers: int = 12, accept=None):
     if not pending_tokens:
         return found, warnings
 
+    started = token()
     stop = False
+
+    def halt() -> bool:
+        return stop or cancelled() or token() != started
     index = 0
     inflight: dict = {}
     worker_count = min(max(1, workers), len(pending_tokens))
 
     def submit_more(pool: ThreadPoolExecutor) -> None:
         nonlocal index
-        while index < len(pending_tokens) and len(inflight) < worker_count and not stop:
-            token = pending_tokens[index]
+        while index < len(pending_tokens) and len(inflight) < worker_count and not halt():
+            board = pending_tokens[index]
             index += 1
-            inflight[pool.submit(fetch, token)] = token
+            inflight[pool.submit(fetch, board)] = board
 
     def take(future) -> None:
         nonlocal stop
-        token = inflight.pop(future)
+        board = inflight.pop(future)
         try:
             payload = future.result()
         except CancelledError:
             return
         except ApiError as exc:
             if not is_missing_board(exc):
-                warnings.append(f"{token}: {exc}")
+                warnings.append(f"{board}: {exc}")
             return
         except (ValueError, OSError) as exc:
-            warnings.append(f"{token}: {exc}")
+            warnings.append(f"{board}: {exc}")
             return
-        found.append((token, payload))
-        if accept is not None and accept(token, payload):
+        found.append((board, payload))
+        if accept is not None and accept(board, payload):
             stop = True
 
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
@@ -577,7 +601,7 @@ def load_boards(tokens: list[str], fetch, workers: int = 12, accept=None):
             done, _pending = wait(inflight, return_when=FIRST_COMPLETED)
             for future in done:
                 take(future)
-            if stop:
+            if halt():
                 for future in inflight:
                     future.cancel()
                 while inflight:
@@ -660,7 +684,10 @@ def fetch_lever_postings(site: str, limit: int = 0, client: ApiClient | None = N
     postings: list = []
     seen: set[str] = set()
     skip = 0
+    started = token()
     while skip < 5000:
+        if cancelled() or token() != started:
+            break
         page = _lever_page(http, site, skip=skip, limit=_LEVER_PAGE)
         fresh = []
         for item in page:

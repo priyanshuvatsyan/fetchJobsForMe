@@ -4,6 +4,7 @@ from dataclasses import replace
 
 from concurrent.futures import ThreadPoolExecutor
 
+from Server.control import stale, token
 from Server.api import (
     ApiError,
     Job,
@@ -101,6 +102,7 @@ class Greenhouse:
     ) -> list[Job]:
         jobs: list[Job] = []
         details: dict[str, tuple[str, object]] = {}
+        started = token()
         company_count = 0
         companies_seen: set[str] = set()
 
@@ -137,10 +139,11 @@ class Greenhouse:
                     company_count += 1
             if fresh and on_batch is not None:
                 on_batch(list(fresh))
-                enriched = self._enrich_many(fresh, details)
-                for old, updated in zip(fresh, enriched):
-                    jobs[jobs.index(old)] = updated
-                on_batch(enriched)
+                if not stale(started):
+                    enriched = self._enrich_many(fresh, details)
+                    for old, updated in zip(fresh, enriched):
+                        jobs[jobs.index(old)] = updated
+                    on_batch(enriched)
             if limit <= 0:
                 return False
             return len(jobs) >= limit and company_count >= min(4, limit)

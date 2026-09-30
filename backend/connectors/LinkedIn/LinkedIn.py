@@ -6,8 +6,6 @@ import json
 import random
 import re
 import sys
-import threading
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urljoin
@@ -19,17 +17,19 @@ _BACKEND = Path(__file__).resolve().parents[2]
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
+from Server.control import pause, stale, token
+from Server.feeds import get_store
 from Server.api import (
     Job,
     clean,
     extract_salary,
-    is_tech_role,
     job_profile,
     money_span,
     plain_text,
     split_description,
     to_datetime,
     within_days,
+    is_tech_role,
 )
 
 MAX_JOBS = 200
@@ -40,56 +40,95 @@ SEARCH_URL = (
     "https://www.linkedin.com/jobs-guest/jobs/api/"
     "seeMoreJobPostings/search"
 )
-JOBS_FILE = Path(__file__).resolve().parents[2] / "data" / "linkedin_jobs.json"
+STORE = get_store("linkedin")
+JOBS_FILE = STORE.path
 
-# Computer science and IT roles. Each keyword is searched in turn, one page at a time.
+# One guest-search query that covers software, data, and ML roles.
 TECH_KEYWORDS = (
-    "software engineer",
-    "software developer",
-    "full stack developer",
-    "frontend developer",
-    "backend developer",
-    "mobile developer",
-    "data analyst",
-    "data scientist",
-    "data engineer",
-    "machine learning engineer",
-    "AI engineer",
-    "devops engineer",
-    "mlops engineer",
-    "cloud engineer",
-    "site reliability engineer",
-    "automation engineer",
-    "QA engineer",
-    "cybersecurity",
-    "database administrator",
-    "IT support",
+    "software engineer OR software developer OR developer OR "
+    "data analyst OR devops OR mlops OR "
+    "machine learning engineer OR AI engineer"
 )
-MAX_PAGES_PER_KEYWORD = 4
 
-# LinkedIn workplace codes: 2 remote, 3 hybrid. sortBy=DD is newest first.
-_INDIA = {"location": "India", "geoId": "102713980", "sortBy": "DD"}
 SEARCHES = (
     {
         "label": "India",
-        "params": dict(_INDIA),
-        "workplace": "",
-    },
-    {
-        "label": "India remote",
-        "params": {**_INDIA, "f_WT": "2"},
-        "workplace": "Remote",
-    },
-    {
-        "label": "India hybrid",
-        "params": {**_INDIA, "f_WT": "3"},
-        "workplace": "Hybrid",
+        "params": {"location": "India", "geoId": "102713980"},
+        "remote": False,
     },
     {
         "label": "Remote",
-        "params": {"f_WT": "2", "sortBy": "DD"},
-        "workplace": "Remote",
+        "params": {"f_WT": "2"},
+        "remote": True,
     },
+)
+
+_INDIA_MARKERS = (
+    "in"
+    "india",
+    "andhra pradesh",
+    "arunachal",
+    "assam",
+    "bihar",
+    "chhattisgarh",
+    "goa",
+    "gujarat",
+    "haryana",
+    "himachal",
+    "jharkhand",
+    "karnataka",
+    "kerala",
+    "madhya pradesh",
+    "maharashtra",
+    "manipur",
+    "meghalaya",
+    "mizoram",
+    "nagaland",
+    "odisha",
+    "punjab",
+    "rajasthan",
+    "sikkim",
+    "tamil nadu",
+    "telangana",
+    "tripura",
+    "uttar pradesh",
+    "uttarakhand",
+    "west bengal",
+    "delhi",
+    "chandigarh",
+    "puducherry",
+    "jammu",
+    "kashmir",
+    "ladakh",
+    "bengaluru",
+    "bangalore",
+    "hyderabad",
+    "mumbai",
+    "pune",
+    "chennai",
+    "noida",
+    "greater noida",
+    "gurgaon",
+    "gurugram",
+    "kolkata",
+    "ahmedabad",
+    "jaipur",
+    "kochi",
+    "thiruvananthapuram",
+    "indore",
+    "lucknow",
+    "nagpur",
+    "coimbatore",
+    "vadodara",
+    "surat",
+    "bhopal",
+    "visakhapatnam",
+    "mysuru",
+    "mysore",
+    "kanpur",
+    "nashik",
+    "faridabad",
+    "ghaziabad",
 )
 
 HEADERS = {
@@ -104,23 +143,22 @@ HEADERS = {
 
 _session = requests.Session()
 _session.headers.update(HEADERS)
-_file_lock = threading.Lock()
-_saved_jobs: list[dict] = []
 
 
-def random_delay() -> None:
+def random_delay() -> bool:
+    """Wait between guest requests. Return True if the fetch was cancelled."""
     delay = random.uniform(MIN_DELAY, MAX_DELAY)
     print(f"Waiting {delay:.1f} seconds...")
-    time.sleep(delay)
+    return pause(delay)
 
 
-def with_workplace(location: str, workplace: str) -> str:
-    if not workplace:
-        return location
-    text = location or workplace
-    if workplace.casefold() in text.casefold():
-        return text
-    return f"{text} ({workplace})"
+def is_india_or_remote(location: str, remote_search: bool = False) -> bool:
+    if remote_search:
+        return True
+    text = (location or "").casefold()
+    if "remote" in text or "work from home" in text:
+        return True
+    return any(marker in text for marker in _INDIA_MARKERS)
 
 
 def _soup(response: requests.Response) -> BeautifulSoup:
@@ -128,7 +166,7 @@ def _soup(response: requests.Response) -> BeautifulSoup:
 
 
 def get_job_cards(start: int = 0, extra: dict | None = None) -> list:
-    params = {"start": start}
+    params = {"start": start, "keywords": TECH_KEYWORDS}
     if extra:
         params.update(extra)
     response = _session.get(SEARCH_URL, params=params, timeout=30)
@@ -293,7 +331,7 @@ def _experience_text(value) -> str:
 def _salary_text(posting: dict, soup: BeautifulSoup, body: str) -> str:
     base = posting.get("baseSalary") or posting.get("estimatedSalary") or {}
     if isinstance(base, str):
-        stated = extract_salary(base)
+        stated = extract_salary("", base)
         if stated:
             return stated
     if isinstance(base, dict):
@@ -304,15 +342,12 @@ def _salary_text(posting: dict, soup: BeautifulSoup, body: str) -> str:
             span = money_span(value.get("minValue"), value.get("maxValue"), symbol)
             if span:
                 return span
-        stated = extract_salary(clean(base.get("name") or ""))
+        stated = extract_salary("", clean(base.get("name") or ""))
         if stated:
             return stated
-    for label, value in _labeled_values(soup):
-        if not re.search(r"(?i)salary|pay|compensation|ctc|stipend", label):
-            continue
-        amount = extract_salary(value)
-        if amount:
-            return amount
+    for _label, value in _labeled_values(soup):
+        if extract_salary("", value):
+            return extract_salary("", value)
     return extract_salary(body)
 
 
@@ -391,49 +426,10 @@ def extract_job_details(url: str, card_posted: str = "") -> dict:
     }
 
 
-def job_record(job: Job) -> dict:
-    """Same shape the other portals write for the jobs page."""
-    return {
-        "portal": job.source,
-        "company": job.company,
-        "role": job.title,
-        "experience": job.experience,
-        "skill": job.skill,
-        "salary": job.salary,
-        "added on": job.posted_at,
-        "location": job.location,
-        "description": {
-            "about company": job.about_company,
-            "job description": job.job_description,
-        },
-        "link": job.url,
-    }
-
-
-def reset_jobs_file() -> None:
-    """A new run replaces the file. Later jobs in that run are added under it."""
-    global _saved_jobs
-    with _file_lock:
-        _saved_jobs = []
-        _write_jobs_file()
-
-
-def append_job(job: Job) -> None:
-    with _file_lock:
-        _saved_jobs.append(job_record(job))
-        _write_jobs_file()
-
-
-def _write_jobs_file() -> None:
-    JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temporary = JOBS_FILE.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(_saved_jobs, indent=4, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(JOBS_FILE)
-
-
 class LinkedIn:
     key = "linkedin"
     label = "LinkedIn"
+    persist = "sidecar"
 
     def __init__(self) -> None:
         self.warnings: list[str] = []
@@ -452,83 +448,111 @@ class LinkedIn:
         del boards, open_browser
         self.warnings = []
         cap = MAX_JOBS if limit <= 0 else limit
-        keywords = (query.strip(),) if query.strip() else TECH_KEYWORDS
+        keywords = query.strip() or TECH_KEYWORDS
         place = where.strip()
         jobs: list[Job] = []
         seen_urls: set[str] = set()
         page_size = 25
-        reset_jobs_file()
+        started = token()
+        epoch = STORE.reset()
 
         searches = SEARCHES
         if place:
-            folded = place.casefold()
             searches = (
                 {
                     "label": place,
-                    "params": {"location": place, "sortBy": "DD"},
-                    "workplace": "Remote" if folded == "remote" else "",
+                    "params": {"location": place},
+                    "remote": place.casefold() == "remote",
                 },
             )
 
-        # Round-robin: page 1 of every keyword, then page 2, so one role does not use up the cap.
-        combos = [(search, keyword) for search in searches for keyword in keywords]
-        exhausted: set[int] = set()
-        for page in range(MAX_PAGES_PER_KEYWORD):
-            if len(jobs) >= cap or len(exhausted) == len(combos):
-                break
-            for combo_index, (search, keyword) in enumerate(combos):
-                if len(jobs) >= cap:
-                    break
-                if combo_index in exhausted:
-                    continue
-                start = page * page_size
+        try:
+            self._collect(
+                searches, keywords, jobs, seen_urls, page_size, cap,
+                posted_within_days, on_batch, started, epoch,
+            )
+        finally:
+            if STORE.epoch == epoch:
+                STORE.flush()
+
+        print()
+        print(f"Saved {len(jobs)} jobs")
+        print(f"File: {JOBS_FILE}")
+        return jobs
+
+    def _collect(
+        self,
+        searches,
+        keywords: str,
+        jobs: list[Job],
+        seen_urls: set[str],
+        page_size: int,
+        cap: int,
+        posted_within_days: int | None,
+        on_batch,
+        started: int,
+        epoch: int,
+    ) -> None:
+        for search in searches:
+            if stale(started):
+                return
+            start = 0
+            while len(jobs) < cap:
+                if stale(started):
+                    return
                 print()
                 print("=" * 70)
                 print(f"SEARCH        : {search['label']}")
-                print(f"KEYWORDS      : {keyword}")
+                print(f"KEYWORDS      : {keywords}")
                 print(f"SEARCH OFFSET : {start}")
                 print(f"JOBS COLLECTED: {len(jobs)}/{cap}")
                 print("=" * 70)
                 params = dict(search["params"])
-                params["keywords"] = keyword
+                params["keywords"] = keywords
                 if posted_within_days:
                     params["f_TPR"] = f"r{int(posted_within_days) * 86400}"
                 try:
                     cards = get_job_cards(start=start, extra=params)
                 except requests.RequestException as error:
                     print(f"Search request failed: {error}")
-                    self.warnings.append(f"{keyword}: {error}")
-                    exhausted.add(combo_index)
-                    continue
+                    self.warnings.append(str(error))
+                    break
                 if not cards:
                     print("No more search results.")
-                    exhausted.add(combo_index)
-                    continue
+                    break
 
                 new_jobs = 0
                 for card in cards:
-                    if len(jobs) >= cap:
+                    if stale(started) or len(jobs) >= cap:
                         break
                     basic = extract_basic_job(card)
                     url = basic["url"]
                     if not url or url in seen_urls:
                         continue
+                    if not is_tech_role(basic["title"] or ""):
+                        continue
+                    if not is_india_or_remote(basic["location"], remote_search=search["remote"]):
+                        print()
+                        print(
+                            "Skipped (not India or remote): "
+                            f"{basic['title']} — {basic['location']}"
+                        )
+                        continue
                     seen_urls.add(url)
                     new_jobs += 1
-                    if not is_tech_role(basic["title"]):
-                        print()
-                        print(f"Skipped (not a CSE/IT role): {basic['title']}")
-                        continue
-                    # India, India-remote, and India-hybrid queries are already limited
-                    # by LinkedIn. The open remote query is workplace-filtered too.
-                    location = with_workplace(basic["location"], search["workplace"])
+                    location = basic["location"]
+                    if search["remote"] and location and "remote" not in location.casefold():
+                        location = f"{location} (Remote)"
+                    elif search["remote"] and not location:
+                        location = "Remote"
 
                     print()
                     print(f"[{len(jobs) + 1}/{cap}]")
                     print(f"Title    : {basic['title']}")
                     print(f"Company  : {basic['company']}")
                     print(f"Location : {location}")
-                    random_delay()
+                    if random_delay():
+                        return
                     details = extract_job_details(url, basic["posted_at"])
                     if (
                         posted_within_days
@@ -559,21 +583,19 @@ class LinkedIn:
                         job_description=details["job_description"] or "",
                     )
                     jobs.append(job)
-                    append_job(job)
+                    STORE.append(job, epoch)
                     if on_batch is not None:
                         on_batch([job])
                     print(f"Collected: {len(jobs)}/{cap}")
 
+                if stale(started):
+                    return
                 if new_jobs == 0:
-                    print("No new jobs on this page.")
-                    exhausted.add(combo_index)
-                if len(jobs) < cap:
-                    random_delay()
-
-        print()
-        print(f"Saved {len(jobs)} jobs")
-        print(f"File: {JOBS_FILE}")
-        return jobs
+                    print("No new jobs found. Stopping.")
+                    break
+                start += page_size
+                if len(jobs) < cap and random_delay():
+                    return
 
 
 if __name__ == "__main__":
