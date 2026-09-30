@@ -26,6 +26,8 @@ if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
 from Server.api import Job, is_tech_role, within_days
+from Server.control import arm, cancel, held
+from Server.feeds import FeedCoordinator
 from connectors.Adzuna import Adzuna
 from connectors.Arbeitnow import Arbeitnow
 from connectors.Ashby import Ashby
@@ -34,8 +36,19 @@ from connectors.Lever import Lever
 from connectors.RemoteOK import RemoteOK
 from connectors.Remotive import Remotive
 from connectors.LinkedIn import LinkedIn
+from connectors.Unstop import Unstop
+from connectors.FourDayWeek import FourDayWeek
+from connectors.Himalayas import Himalayas
+from connectors.Instahyre import Instahyre
+from connectors.Jobicy import Jobicy
+from connectors.Shine import Shine
+from connectors.TheMuse import TheMuse
+from connectors.WeWorkRemotely import WeWorkRemotely
+from connectors.WorkingNomads import WorkingNomads
 
 SLUG_SOURCES = {"greenhouse", "lever", "ashby"}
+# Instahyre connector code stays in tree, but live web fetch is paused (rate limits / slow).
+PAUSED_SIDECAR_KEYS = {"instahyre"}
 CONNECTORS = [
     Greenhouse,
     Lever,
@@ -45,6 +58,15 @@ CONNECTORS = [
     Arbeitnow,
     Adzuna,
     LinkedIn,
+    Unstop,
+    Shine,
+    Instahyre,
+    Himalayas,
+    Jobicy,
+    TheMuse,
+    WorkingNomads,
+    FourDayWeek,
+    WeWorkRemotely,
 ]
 BY_KEY = {connector.key: connector for connector in CONNECTORS}
 
@@ -66,13 +88,21 @@ _progress = {
     "error": "",
     "fetchedAt": "",
     "last_write": 0.0,
+    "stopped": False,
 }
 
 CREDITS = {
     "remotive": "Credit: jobs from Remotive — https://remotive.com",
     "remoteok": "Credit: jobs from Remote OK — https://remoteok.com (link each job URL)",
     "adzuna": "Credit: Jobs by Adzuna — https://www.adzuna.com",
+    "himalayas": "Jobs sourced from Himalayas — https://himalayas.app",
+    "jobicy": "Jobs sourced from Jobicy — https://jobicy.com",
+    "themuse": "Jobs sourced from The Muse — https://www.themuse.com",
+    "fourdayweek": "Jobs sourced from 4 Day Week — https://4dayweek.io",
+    "weworkremotely": "Jobs sourced from We Work Remotely — https://weworkremotely.com",
 }
+SIDECAR_SOURCES = [cls for cls in CONNECTORS if getattr(cls, "persist", "") == "sidecar"]
+FEED_COORDINATOR = FeedCoordinator(SIDECAR_SOURCES, WINDOW_DAYS, paused=PAUSED_SIDECAR_KEYS)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -164,9 +194,13 @@ def run_connector(
         "limit": limit,
         "boards": site_boards,
     }
-    if posted_within_days and (cls.key in SLUG_SOURCES or cls.key == "linkedin"):
+    if posted_within_days and (
+        cls.key in SLUG_SOURCES or getattr(cls, "persist", "") == "sidecar"
+    ):
         kwargs["posted_within_days"] = posted_within_days
-    if publish is not None and (cls.key in SLUG_SOURCES or cls.key == "linkedin"):
+    if publish is not None and (
+        cls.key in SLUG_SOURCES or getattr(cls, "persist", "") == "sidecar"
+    ):
         kwargs["on_batch"] = on_batch
     if cls.key == "linkedin":
         jobs = connector.fetch(**kwargs, open_browser=open_browser)
@@ -174,7 +208,11 @@ def run_connector(
         jobs = connector.fetch(**kwargs)
     jobs = [job for job in jobs if is_tech_role(job.title)]
     if posted_within_days:
-        jobs = [job for job in jobs if within_days(job.posted_at, posted_within_days)]
+        jobs = [
+            job
+            for job in jobs
+            if not job.posted_at or within_days(job.posted_at, posted_within_days)
+        ]
     if publish is not None:
         # Board portals already published each company. This call records notes.
         publish(connector, [] if streamed else jobs)
@@ -592,6 +630,7 @@ def _payload_from_progress(loading: bool, cached: bool = False) -> dict:
         "cached": cached,
         "fetchedAt": "" if loading else _progress["fetchedAt"],
         "error": _progress["error"],
+        "stopped": bool(_progress.get("stopped")),
     }
 
 
@@ -624,7 +663,7 @@ def _remember(generation: int, connector, batch: list[Job]) -> None:
             _progress["linkedin"] = getattr(connector, "search_url", "") or ""
         now = time.monotonic()
         if batch and now - _progress.get("last_write", 0.0) >= 0.6:
-            write_jobs_file(_payload_from_progress(loading=True))
+            write_jobs_file(_payload_from_progress(loading=not _progress.get("stopped")))
             _progress["last_write"] = now
 
 
@@ -642,53 +681,8 @@ def _finish_fetch(generation: int, error: str = "") -> None:
 
 
 def _portal_sources() -> list[type]:
-    """Greenhouse, Lever, and the other shared-file portals. LinkedIn writes its own file."""
-    return [cls for cls in CONNECTORS if cls.key != "linkedin"]
-
-
-_linkedin_lock = threading.Lock()
-_linkedin_running = False
-LINKEDIN_FILE = Path(__file__).resolve().parents[1] / "data" / "linkedin_jobs.json"
-
-
-def read_linkedin_jobs() -> list:
-    try:
-        payload = json.loads(LINKEDIN_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    if not isinstance(payload, list):
-        return []
-    return [job for job in payload if isinstance(job, dict) and is_tech_role(job.get("role", ""))]
-
-
-def _linkedin_worker() -> None:
-    global _linkedin_running
-    try:
-        LinkedIn().fetch(limit=0, open_browser=False, posted_within_days=WINDOW_DAYS)
-    except Exception as exc:
-        print(f"LinkedIn fetch failed: {exc}")
-    finally:
-        with _linkedin_lock:
-            _linkedin_running = False
-
-
-def start_linkedin(refresh: bool) -> None:
-    """Fetch LinkedIn into its own file while the other portals write jobs.json."""
-    global _linkedin_running
-    with _linkedin_lock:
-        if _linkedin_running:
-            return
-        if not refresh and read_linkedin_jobs():
-            return
-        _linkedin_running = True
-        threading.Thread(target=_linkedin_worker, name="linkedin-fetch", daemon=True).start()
-
-
-def linkedin_payload() -> dict:
-    with _linkedin_lock:
-        loading = _linkedin_running
-    jobs = read_linkedin_jobs()
-    return {"jobs": jobs, "count": len(jobs), "loading": loading}
+    """Portals that share jobs.json; independent feeds use sidecar JSON files."""
+    return [cls for cls in CONNECTORS if getattr(cls, "persist", "") != "sidecar"]
 
 
 def _fetch_worker(country: str, generation: int) -> None:
@@ -722,31 +716,84 @@ def _reset_progress() -> None:
     _progress["error"] = ""
     _progress["fetchedAt"] = ""
     _progress["last_write"] = 0.0
+    _progress["stopped"] = False
+    arm()
+    FEED_COORDINATOR.suppressed = False
+
+
+def stop_fetches() -> dict:
+    """Stop every portal and keep the jobs already written to JSON."""
+    cancel()
+    FEED_COORDINATOR.stop()
+    with _jobs_lock:
+        _progress["stopped"] = True
+        _progress["running"] = False
+        _progress["fetchedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        note = {"portal": "fetch", "message": "Stopped. Showing jobs saved so far."}
+        if note not in _progress["notes"]:
+            _progress["notes"].append(note)
+        payload = _payload_from_progress(loading=False)
+        write_jobs_file(payload)
+    return FEED_COORDINATOR.merge(payload, CREDITS)
+
+
+def _start_main_fetch(country: str, refresh_sidecars: bool) -> dict:
+    with _jobs_lock:
+        _reset_progress()
+        generation = _progress["generation"]
+        payload = _payload_from_progress(loading=True)
+    FEED_COORDINATOR.start_all(refresh_sidecars)
+    threading.Thread(
+        target=_fetch_worker,
+        args=(country, generation),
+        name="jobs-fetch",
+        daemon=True,
+    ).start()
+    return payload
 
 
 def saved_or_live_jobs(country: str, refresh: bool) -> dict:
     """Return the saved file when it is complete. A new fetch returns jobs as each company comes in."""
-    start_linkedin(refresh)
-    with _jobs_lock:
-        if _progress["running"] and not refresh:
-            return _payload_from_progress(loading=True)
-        if not refresh and not _progress["running"]:
-            saved = read_jobs_file()
-            if saved is not None and _snapshot_current(saved):
+    if refresh:
+        payload = _start_main_fetch(country, True)
+        return FEED_COORDINATOR.merge(payload, CREDITS)
+
+    saved = read_jobs_file()
+    if held() or FEED_COORDINATOR.suppressed or _progress.get("stopped") or (saved or {}).get("stopped"):
+        FEED_COORDINATOR.suppressed = True
+        with _jobs_lock:
+            if _progress.get("stopped") or _progress["jobs"]:
+                payload = _payload_from_progress(loading=False)
+            elif saved is not None:
                 saved["cached"] = True
                 saved["loading"] = False
-                return saved
+                saved["stopped"] = True
+                saved["portals"] = _portal_list()
+                payload = saved
+            else:
+                payload = _payload_from_progress(loading=False)
+        return FEED_COORDINATOR.merge(payload, CREDITS)
+
+    with _jobs_lock:
         if _progress["running"]:
-            return _payload_from_progress(loading=True)
-        _reset_progress()
-        generation = _progress["generation"]
-        threading.Thread(
-            target=_fetch_worker,
-            args=(country, generation),
-            name="jobs-fetch",
-            daemon=True,
-        ).start()
-        return _payload_from_progress(loading=True)
+            payload = _payload_from_progress(loading=True)
+            running = True
+        else:
+            payload = None
+            running = False
+    if running:
+        FEED_COORDINATOR.start_all(False)
+        return FEED_COORDINATOR.merge(payload, CREDITS)
+
+    if saved is not None and _snapshot_current(saved):
+        FEED_COORDINATOR.start_all(False)
+        saved["cached"] = True
+        saved["loading"] = False
+        saved["portals"] = _portal_list()
+        return FEED_COORDINATOR.merge(saved, CREDITS)
+
+    payload = _start_main_fetch(country, False)
+    return FEED_COORDINATOR.merge(payload, CREDITS)
 
 
 class JobsApiHandler(BaseHTTPRequestHandler):
@@ -766,14 +813,23 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         if route.path == "/api/health":
             self._send_json(200, {"status": "ok"})
             return
+        if route.path == "/api/jobs/stop":
+            self._send_json(200, stop_fetches())
+            return
         if route.path == "/api/portals":
             self._send_json(200, {"portals": [{"key": cls.key, "label": cls.label} for cls in CONNECTORS]})
             return
         if route.path == "/api/linkedin":
             first = lambda name, fallback="": (params.get(name) or [fallback])[0].strip()  # noqa: E731
             refresh = first("refresh", "").casefold() in {"1", "true", "yes"}
-            start_linkedin(refresh)
-            self._send_json(200, linkedin_payload())
+            FEED_COORDINATOR.start("linkedin", refresh)
+            self._send_json(200, FEED_COORDINATOR.payload("linkedin"))
+            return
+        if route.path == "/api/unstop":
+            first = lambda name, fallback="": (params.get(name) or [fallback])[0].strip()  # noqa: E731
+            refresh = first("refresh", "").casefold() in {"1", "true", "yes"}
+            FEED_COORDINATOR.start("unstop", refresh)
+            self._send_json(200, FEED_COORDINATOR.payload("unstop"))
             return
         if route.path != "/api/jobs":
             self._send_json(404, {"error": f"unknown path {route.path}"})

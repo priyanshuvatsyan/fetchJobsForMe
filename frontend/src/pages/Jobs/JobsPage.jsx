@@ -21,7 +21,7 @@ const JobsPage = () => {
   const [filters, setFilters] = useState(DEFAULT_FILTERS)
   const [page, setPage] = useState(1)
 
-  const { jobs, portals, credits, notes, status, error, reload } = useJobs()
+  const { jobs, portals, credits, notes, status, error, reload, stop, loading: fetching } = useJobs()
   const visibleJobs = useJobFilters(jobs, filters)
   const pageJobs = visibleJobs.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
 
@@ -52,11 +52,11 @@ const JobsPage = () => {
             ) : null}
             <Button
               variant="secondary"
-              className={loading ? 'is-busy' : ''}
-              onClick={reload}
-              disabled={loading}
+              className={fetching ? 'is-stop' : ''}
+              onClick={fetching ? stop : reload}
+              disabled={!fetching && loading}
             >
-              {loading ? 'Loading...' : 'Refresh'}
+              {fetching ? 'Stop' : 'Refresh'}
             </Button>
           </div>
         </header>

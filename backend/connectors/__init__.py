@@ -1,1 +1,1 @@
-"""Job-source connectors. LinkedIn lives in connectors/LinkedIn."""
+"""Job-source connectors. LinkedIn and Unstop each live in their own folder."""

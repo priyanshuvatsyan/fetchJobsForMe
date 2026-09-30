@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { fetchJobs, fetchLinkedInJobs } from '../api/jobs'
+import { fetchJobs, stopJobs } from '../api/jobs'
 
 const EMPTY = {
   jobs: [],
@@ -32,25 +32,14 @@ export function useJobs() {
     request.current = controller
     setStatus('loading')
     setError(null)
+    if (refresh) setData((current) => ({ ...current, loading: true }))
 
     const pull = (isRefresh) => {
-      Promise.all([
-        fetchJobs({ refresh: isRefresh }, controller.signal),
-        fetchLinkedInJobs({ refresh: isRefresh }, controller.signal),
-      ])
-        .then(([result, linkedin]) => {
+      fetchJobs({ refresh: isRefresh }, controller.signal)
+        .then((result) => {
           if (gen !== generation.current || controller.signal.aborted) return
-          const seen = new Set()
-          const jobs = []
-          for (const job of [...result.jobs, ...linkedin.jobs]) {
-            const key = job.link || job.id
-            if (seen.has(key)) continue
-            seen.add(key)
-            jobs.push(job)
-          }
-          const loading = result.loading || linkedin.loading
-          setData({ ...result, jobs, loading })
-          if (loading) {
+          setData(result)
+          if (result.loading) {
             timer.current = setTimeout(() => pull(false), 1000)
             return
           }
@@ -77,7 +66,38 @@ export function useJobs() {
 
   const reload = useCallback(() => load(true), [load])
 
-  return { ...data, status, error, reload }
+  const stop = useCallback(() => {
+    const gen = generation.current + 1
+    generation.current = gen
+    request.current?.abort()
+    clearTimeout(timer.current)
+    const controller = new AbortController()
+    request.current = controller
+    stopJobs(controller.signal)
+      .then((result) => {
+        if (gen !== generation.current || controller.signal.aborted) return
+        setData(result)
+        setStatus('success')
+        setError(null)
+        timer.current = setTimeout(() => {
+          fetchJobs({ refresh: false }, controller.signal)
+            .then((latest) => {
+              if (gen !== generation.current || controller.signal.aborted) return
+              setData({ ...latest, loading: false })
+            })
+            .catch((cause) => {
+              if (cause?.name === 'AbortError') return
+            })
+        }, 1200)
+      })
+      .catch((cause) => {
+        if (gen !== generation.current || controller.signal.aborted || cause.name === 'AbortError') return
+        setError(cause)
+        setStatus('error')
+      })
+  }, [])
+
+  return { ...data, status, error, reload, stop }
 }
 
 export default useJobs
