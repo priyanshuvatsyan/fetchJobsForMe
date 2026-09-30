@@ -22,6 +22,68 @@
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
 }
 
+.app-root[data-theme='light'] .jobs-page {
+  --jb-bg: #f4f6fa;
+  --jb-surface-2: #ffffff;
+  --jb-surface-2-raised: #f8f9fc;
+  --jb-surface-3: #f0f2f7;
+  --jb-surface-4: #e7ebf2;
+  --jb-border: #dce2eb;
+  --jb-border-strong: #aeb8c9;
+  --jb-text: #202b40;
+  --jb-text-muted: #59677e;
+  --jb-text-faint: #718097;
+  --jb-accent: #6454d8;
+  --jb-accent-hover: #5343c6;
+  --jb-accent-soft: #5144ad;
+}
+
+.app-root[data-theme='light'] .jobs-page .badge-accent {
+  background: #f0edff;
+  border-color: #cfc7fb;
+  color: #5142a6;
+}
+
+.app-root[data-theme='light'] .jobs-page .badge-success {
+  background: #e9f8f1;
+  border-color: #b8e6d0;
+  color: #176b4c;
+}
+
+.app-root[data-theme='light'] .jobs-page .badge-info {
+  background: #edf4ff;
+  border-color: #c7dcfb;
+  color: #285b9b;
+}
+
+.app-root[data-theme='light'] .jobs-page .badge-warning {
+  background: #fff5df;
+  border-color: #f0d89e;
+  color: #795508;
+}
+
+.app-root[data-theme='light'] .jobs-page .callout-warning {
+  border-color: #ead08f;
+  background: #fff9eb;
+}
+
+.app-root[data-theme='light'] .jobs-page .callout-warning .callout-title {
+  color: #76540d;
+}
+
+.app-root[data-theme='light'] .jobs-page .callout-error {
+  border-color: #edb9b9;
+  background: #fff1f1;
+}
+
+.app-root[data-theme='light'] .jobs-page .callout-error .callout-title {
+  color: #9f2f37;
+}
+
+.app-root[data-theme='light'] .jobs-page .search-field-input input::-webkit-search-cancel-button {
+  filter: none;
+}
+
 .jobs-page-inner {
   display: flex;
   flex-direction: column;
