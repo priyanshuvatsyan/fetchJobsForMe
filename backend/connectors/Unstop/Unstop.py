@@ -17,6 +17,7 @@ from Server.api import (
     clean,
     format_skills,
     is_tech_role,
+    keeps_india_hybrid_or_remote,
     job_profile,
     plain_text,
     split_description,
@@ -96,17 +97,18 @@ def workplace_label(item: dict) -> str:
 
 
 def keep_location(item: dict) -> bool:
-    """India on-site, India remote, India hybrid, and remote or hybrid work."""
-    if workplace_label(item):
-        return True
+    """India, Indian hybrid, or remote work."""
+    text = location_text(item)
     countries = [
         str(loc.get("country"))
         for loc in (item.get("locations") or [])
         if isinstance(loc, dict) and loc.get("country")
     ]
-    if not countries:
+    if any(country.casefold() == "india" for country in countries):
         return True
-    return any(country.casefold() == "india" for country in countries)
+    if not countries and text in {"", "India"}:
+        return True
+    return keeps_india_hybrid_or_remote(text)
 
 
 def location_text(item: dict) -> str:

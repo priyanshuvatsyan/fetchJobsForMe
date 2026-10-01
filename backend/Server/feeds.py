@@ -7,15 +7,23 @@ import threading
 import time
 from pathlib import Path
 
-from Server.api import Job, is_tech_role, within_days
+from Server.api import Job, is_tech_role, keeps_india_hybrid_or_remote, visible_record, within_days
 from Server.control import held, stale, token as current_token
+
+
+def _event(portal: str, level: str, message: str) -> None:
+    """Write a portal line through server.py. Imported on use to avoid a circular import."""
+    from Server.server import event
+
+    event(portal, level, message)
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
 
-def job_record(job: Job) -> dict:
+def job_record(job: Job, portal_key: str = "") -> dict:
     return {
         "portal": job.source,
+        "portalKey": portal_key,
         "company": job.company,
         "role": job.title,
         "experience": job.experience,
@@ -54,14 +62,17 @@ class SidecarStore:
         with self._lock:
             if epoch is not None and epoch != self.epoch:
                 return
-            self._records.append(job_record(job))
+            self._records.append(job_record(job, self.key))
             now = time.monotonic()
             if now - self._last_write >= 0.5:
                 self._write()
                 self._last_write = now
 
     def flush(self) -> None:
+        """Write the in-memory list. A store that never started a fetch owns nothing, so the file is left alone."""
         with self._lock:
+            if self.epoch == 0:
+                return
             self._write()
             self._last_write = time.monotonic()
 
@@ -72,11 +83,14 @@ class SidecarStore:
             return []
         if not isinstance(payload, list):
             return []
-        return [
-            record
-            for record in payload
-            if isinstance(record, dict) and is_tech_role(record.get("role", ""))
-        ]
+        visible = []
+        for record in payload:
+            if not isinstance(record, dict) or not visible_record(record):
+                continue
+            if record.get("portalKey") != self.key:
+                record = {**record, "portalKey": self.key}
+            visible.append(record)
+        return visible
 
     def _write(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -113,6 +127,7 @@ class SidecarConnector:
 
     def __init__(self) -> None:
         self.warnings: list[str] = []
+        self.error = ""
 
     def iter_items(self, query: str, posted_within_days: int | None):
         raise NotImplementedError
@@ -152,6 +167,8 @@ class SidecarConnector:
                 seen.add(job.url)
                 if not is_tech_role(job.title):
                     continue
+                if not keeps_india_hybrid_or_remote(job.location):
+                    continue
                 if (
                     posted_within_days
                     and job.posted_at
@@ -168,8 +185,8 @@ class SidecarConnector:
                     on_batch([job])
                 print(f"{self.label} [{len(jobs)}] {job.title} — {job.company}")
         except Exception as exc:
-            self.warnings.append(str(exc))
-            print(f"{self.label} fetch failed: {exc}")
+            self.error = str(exc)
+            self.warnings.append(self.error)
         finally:
             if store.epoch == epoch:
                 store.flush()
@@ -192,7 +209,9 @@ class FeedCoordinator:
         self._running: set[str] = set()
         self._run_tokens: dict[str, int] = {}
         self._warnings: dict[str, list[str]] = {}
+        self._errors: dict[str, str] = {}
         self._timings: dict[str, float] = {}
+        self._announced: set[str] = set()
         self.suppressed = False
 
     def start_all(self, refresh: bool) -> None:
@@ -201,7 +220,14 @@ class FeedCoordinator:
 
     def start(self, key: str, refresh: bool) -> None:
         connector_class = self.connectors.get(key)
-        if connector_class is None or key in self.paused:
+        if connector_class is None:
+            return
+        if key in self.paused:
+            with self._lock:
+                announce = key not in self._announced
+                self._announced.add(key)
+            if announce:
+                _event(key, "info", "paused")
             return
         if not refresh and (self.suppressed or held()):
             return
@@ -232,34 +258,59 @@ class FeedCoordinator:
         connector = connector_class()
         key = connector_class.key
         started = time.perf_counter()
+        jobs: list[Job] = []
+        _event(key, "info", f"start window={self.window_days}")
         try:
             kwargs = {"limit": 0, "posted_within_days": self.window_days}
             if key == "linkedin":
                 kwargs["open_browser"] = False
-            connector.fetch(**kwargs)
+            jobs = connector.fetch(**kwargs)
             if current_token() == run_token:
                 get_store(key).flush()
             self._warnings[key] = list(connector.warnings)
+            self._errors[key] = getattr(connector, "error", "") or ""
+            if self._errors[key]:
+                _event(key, "error", self._errors[key])
+            for warning in self._warnings[key]:
+                if warning != self._errors[key]:
+                    _event(key, "warning", warning)
         except Exception as exc:
+            self._errors[key] = str(exc)
             self._warnings[key] = [str(exc)]
-            print(f"{connector_class.label} fetch failed: {exc}")
+            _event(key, "error", f"fetch failed: {exc}")
         finally:
-            self._timings[key] = round(time.perf_counter() - started, 1)
+            elapsed = round(time.perf_counter() - started, 1)
+            self._timings[key] = elapsed
+            _event(key, "info", f"done jobs={len(jobs)} seconds={elapsed}")
             with self._lock:
                 if self._run_tokens.get(key) == run_token:
                     self._running.discard(key)
 
-    def payload(self, key: str) -> dict:
-        jobs = get_store(key).read()
+    def status(self) -> dict[str, dict]:
+        """Live portal state keyed by the same id the jobs and logs use."""
         with self._lock:
-            loading = key in self._running
-        return {"jobs": jobs, "count": len(jobs), "loading": loading}
+            running = set(self._running)
+            warnings = {key: list(value) for key, value in self._warnings.items()}
+            errors = dict(self._errors)
+            timings = dict(self._timings)
+        report = {}
+        for key in self.connectors:
+            error = errors.get(key) or ""
+            report[key] = {
+                "running": key in running,
+                "error": error,
+                "warnings": [item for item in warnings.get(key, []) if item != error],
+                "seconds": timings.get(key),
+            }
+        return report
 
     def merge(self, payload: dict, credits: dict[str, str]) -> dict:
         result = dict(payload)
         jobs: list[dict] = []
         seen: set[str] = set()
         for record in payload.get("jobs") or []:
+            if not visible_record(record):
+                continue
             link = record.get("link") or ""
             key = link or f"{record.get('portal')}:{record.get('company')}:{record.get('role')}"
             if key in seen:
@@ -290,6 +341,9 @@ class FeedCoordinator:
         notes = list(payload.get("notes") or [])
         for key, warnings in self._warnings.items():
             label = self.connectors[key].label
-            notes.extend({"portal": label, "message": warning} for warning in warnings)
+            notes.extend(
+                {"portal": label, "portalKey": key, "message": warning}
+                for warning in warnings
+            )
         result["notes"] = notes
         return result

@@ -23,16 +23,15 @@ from Server.api import (
     Job,
     clean,
     extract_salary,
+    is_tech_role,
     job_profile,
+    keeps_india_hybrid_or_remote,
     money_span,
     plain_text,
     split_description,
     to_datetime,
     within_days,
-    is_tech_role,
 )
-
-MAX_JOBS = 200
 MIN_DELAY = 1.0
 MAX_DELAY = 10.0
 BASE_URL = "https://www.linkedin.com"
@@ -50,6 +49,7 @@ TECH_KEYWORDS = (
     "machine learning engineer OR AI engineer"
 )
 
+# India (onsite and hybrid), Indian hybrid, and remote work anywhere.
 SEARCHES = (
     {
         "label": "India",
@@ -57,78 +57,15 @@ SEARCHES = (
         "remote": False,
     },
     {
+        "label": "India hybrid",
+        "params": {"location": "India", "geoId": "102713980", "f_WT": "3"},
+        "remote": False,
+    },
+    {
         "label": "Remote",
         "params": {"f_WT": "2"},
         "remote": True,
     },
-)
-
-_INDIA_MARKERS = (
-    "in"
-    "india",
-    "andhra pradesh",
-    "arunachal",
-    "assam",
-    "bihar",
-    "chhattisgarh",
-    "goa",
-    "gujarat",
-    "haryana",
-    "himachal",
-    "jharkhand",
-    "karnataka",
-    "kerala",
-    "madhya pradesh",
-    "maharashtra",
-    "manipur",
-    "meghalaya",
-    "mizoram",
-    "nagaland",
-    "odisha",
-    "punjab",
-    "rajasthan",
-    "sikkim",
-    "tamil nadu",
-    "telangana",
-    "tripura",
-    "uttar pradesh",
-    "uttarakhand",
-    "west bengal",
-    "delhi",
-    "chandigarh",
-    "puducherry",
-    "jammu",
-    "kashmir",
-    "ladakh",
-    "bengaluru",
-    "bangalore",
-    "hyderabad",
-    "mumbai",
-    "pune",
-    "chennai",
-    "noida",
-    "greater noida",
-    "gurgaon",
-    "gurugram",
-    "kolkata",
-    "ahmedabad",
-    "jaipur",
-    "kochi",
-    "thiruvananthapuram",
-    "indore",
-    "lucknow",
-    "nagpur",
-    "coimbatore",
-    "vadodara",
-    "surat",
-    "bhopal",
-    "visakhapatnam",
-    "mysuru",
-    "mysore",
-    "kanpur",
-    "nashik",
-    "faridabad",
-    "ghaziabad",
 )
 
 HEADERS = {
@@ -150,15 +87,6 @@ def random_delay() -> bool:
     delay = random.uniform(MIN_DELAY, MAX_DELAY)
     print(f"Waiting {delay:.1f} seconds...")
     return pause(delay)
-
-
-def is_india_or_remote(location: str, remote_search: bool = False) -> bool:
-    if remote_search:
-        return True
-    text = (location or "").casefold()
-    if "remote" in text or "work from home" in text:
-        return True
-    return any(marker in text for marker in _INDIA_MARKERS)
 
 
 def _soup(response: requests.Response) -> BeautifulSoup:
@@ -447,7 +375,7 @@ class LinkedIn:
     ) -> list[Job]:
         del boards, open_browser
         self.warnings = []
-        cap = MAX_JOBS if limit <= 0 else limit
+        cap = None if limit <= 0 else limit
         keywords = query.strip() or TECH_KEYWORDS
         place = where.strip()
         jobs: list[Job] = []
@@ -487,7 +415,7 @@ class LinkedIn:
         jobs: list[Job],
         seen_urls: set[str],
         page_size: int,
-        cap: int,
+        cap: int | None,
         posted_within_days: int | None,
         on_batch,
         started: int,
@@ -497,7 +425,7 @@ class LinkedIn:
             if stale(started):
                 return
             start = 0
-            while len(jobs) < cap:
+            while cap is None or len(jobs) < cap:
                 if stale(started):
                     return
                 print()
@@ -505,7 +433,7 @@ class LinkedIn:
                 print(f"SEARCH        : {search['label']}")
                 print(f"KEYWORDS      : {keywords}")
                 print(f"SEARCH OFFSET : {start}")
-                print(f"JOBS COLLECTED: {len(jobs)}/{cap}")
+                print(f"JOBS COLLECTED: {len(jobs)}" + (f"/{cap}" if cap else ""))
                 print("=" * 70)
                 params = dict(search["params"])
                 params["keywords"] = keywords
@@ -523,7 +451,7 @@ class LinkedIn:
 
                 new_jobs = 0
                 for card in cards:
-                    if stale(started) or len(jobs) >= cap:
+                    if stale(started) or (cap is not None and len(jobs) >= cap):
                         break
                     basic = extract_basic_job(card)
                     url = basic["url"]
@@ -531,23 +459,25 @@ class LinkedIn:
                         continue
                     if not is_tech_role(basic["title"] or ""):
                         continue
-                    if not is_india_or_remote(basic["location"], remote_search=search["remote"]):
-                        print()
-                        print(
-                            "Skipped (not India or remote): "
-                            f"{basic['title']} — {basic['location']}"
-                        )
-                        continue
-                    seen_urls.add(url)
-                    new_jobs += 1
                     location = basic["location"]
                     if search["remote"] and location and "remote" not in location.casefold():
                         location = f"{location} (Remote)"
                     elif search["remote"] and not location:
                         location = "Remote"
+                    elif search["label"] == "India hybrid" and "hybrid" not in location.casefold():
+                        location = f"{location} (Hybrid)" if location else "India (Hybrid)"
+                    if not keeps_india_hybrid_or_remote(location):
+                        print()
+                        print(
+                            "Skipped (not India, Indian hybrid, or remote): "
+                            f"{basic['title']} — {basic['location']}"
+                        )
+                        continue
+                    seen_urls.add(url)
+                    new_jobs += 1
 
                     print()
-                    print(f"[{len(jobs) + 1}/{cap}]")
+                    print(f"[{len(jobs) + 1}]" if cap is None else f"[{len(jobs) + 1}/{cap}]")
                     print(f"Title    : {basic['title']}")
                     print(f"Company  : {basic['company']}")
                     print(f"Location : {location}")
@@ -586,7 +516,7 @@ class LinkedIn:
                     STORE.append(job, epoch)
                     if on_batch is not None:
                         on_batch([job])
-                    print(f"Collected: {len(jobs)}/{cap}")
+                    print(f"Collected: {len(jobs)}" + (f"/{cap}" if cap else ""))
 
                 if stale(started):
                     return
@@ -594,15 +524,14 @@ class LinkedIn:
                     print("No new jobs found. Stopping.")
                     break
                 start += page_size
-                if len(jobs) < cap and random_delay():
+                if (cap is None or len(jobs) < cap) and random_delay():
                     return
 
 
 if __name__ == "__main__":
     print("=" * 70)
     print("LINKEDIN JOBS")
-    print("Tech roles in India and remote")
-    print(f"Target jobs: {MAX_JOBS}")
+    print("Tech roles in India, Indian hybrid, and remote")
     print("=" * 70)
     try:
         LinkedIn().fetch(limit=0, open_browser=False)

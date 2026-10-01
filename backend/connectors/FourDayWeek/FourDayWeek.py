@@ -20,7 +20,7 @@ class FourDayWeek(SidecarConnector):
             params = {
                 "page": page,
                 "limit": 100,
-                "posted_after": posted_within_days or 30,
+                "posted_after": posted_within_days or 15,
                 "category": "engineering",
                 "sort": "date",
             }

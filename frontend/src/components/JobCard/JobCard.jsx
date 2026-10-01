@@ -61,7 +61,13 @@ export const SegmentedControl = ({ label, value, onChange, options }) => (
   </div>
 )
 
-const JobCard = ({ job, defaultExpanded = false }) => {
+const StarIcon = ({ filled }) => (
+  <svg viewBox="0 0 24 24" aria-hidden="true" fill={filled ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round">
+    <path d="m12 3.5 2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8-4.3-4.1 5.9-.9L12 3.5Z" />
+  </svg>
+)
+
+const JobCard = ({ job, defaultExpanded = false, saved = false, onToggleSave }) => {
   const [expanded, setExpanded] = useState(defaultExpanded)
   const panelId = useId()
   const mode = workMode(job.location)
@@ -106,16 +112,16 @@ const JobCard = ({ job, defaultExpanded = false }) => {
               <span aria-hidden="true">↗</span>
             </Button>
           ) : null}
-          {hasDescription ? (
+          {onToggleSave && job.link ? (
             <button
               type="button"
-              className="job-card-toggle"
-              onClick={toggle}
-              aria-expanded={expanded}
-              aria-controls={panelId}
-              aria-label={expanded ? 'Hide description' : 'Show description'}
+              className={`job-card-save ${saved ? 'is-saved' : ''}`.trim()}
+              onClick={() => onToggleSave(job)}
+              aria-pressed={saved}
+              aria-label={saved ? `Remove ${job.role} from saved jobs` : `Save ${job.role}`}
+              title={saved ? 'Remove from saved jobs' : 'Save job'}
             >
-              <span aria-hidden="true">▾</span>
+              <StarIcon filled={saved} />
             </button>
           ) : null}
         </div>

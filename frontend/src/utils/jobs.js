@@ -9,7 +9,7 @@ export const DATE_RANGES = {
   any: { label: 'Any time', days: null },
   today: { label: 'Today', days: 1 },
   week: { label: 'Last 7 days', days: 7 },
-  month: { label: 'Last 30 days', days: 30 },
+  month: { label: 'Last 15 days', days: 15 },
 }
 
 export const SORT_OPTIONS = [
@@ -28,6 +28,7 @@ export function normalizeJob(record, index = 0) {
   return {
     id: record.link || `${record.company}-${record.role}-${index}`,
     portal: record.portal || '',
+    portalKey: record.portalKey || '',
     company: record.company || '',
     role: record.role || '',
     experience: record.experience || '',
@@ -37,10 +38,31 @@ export function normalizeJob(record, index = 0) {
       .filter(Boolean),
     salary: record.salary || '',
     postedAt: record['added on'] || '',
+    savedAt: record['saved at'] || '',
     location: record.location || '',
     aboutCompany: description['about company'] || '',
     jobDescription: description['job description'] || '',
     link: record.link || '',
+  }
+}
+
+/** Inverse of normalizeJob: the record shape the API stores. */
+export function toRecord(job) {
+  return {
+    portal: job.portal,
+    portalKey: job.portalKey,
+    company: job.company,
+    role: job.role,
+    experience: job.experience,
+    skill: job.skills.join(', '),
+    salary: job.salary,
+    'added on': job.postedAt,
+    location: job.location,
+    description: {
+      'about company': job.aboutCompany,
+      'job description': job.jobDescription,
+    },
+    link: job.link,
   }
 }
 
@@ -173,12 +195,19 @@ function includes(haystack, needle) {
   return !text || haystack.toLowerCase().includes(text)
 }
 
+/** Stable portal id from the API. Display names such as "4 Day Week" are not compared. */
+export function portalKeyOf(job, portals = []) {
+  if (job.portalKey) return job.portalKey
+  const label = (job.portal || '').toLowerCase()
+  const match = portals.find((portal) => (portal.label || '').toLowerCase() === label)
+  return match?.key || ''
+}
+
 /** Search, location, portal, and company tokens applied to the saved job list. */
-export function matchesJob(job, { query = '', where = '', source = 'all', boards = '' }) {
+export function matchesJob(job, { query = '', where = '', source = 'all', boards = '' }, portals = []) {
   const haystack = `${job.role} ${job.company} ${job.location}`
   if (!includes(haystack, query) || !includes(haystack, where)) return false
-  const portalKey = (value) => value.toLowerCase().replace(/[^a-z0-9]/g, '')
-  if (source !== 'all' && portalKey(job.portal) !== portalKey(source)) return false
+  if (source !== 'all' && portalKeyOf(job, portals) !== source) return false
   const tokens = boards
     .split(',')
     .map((token) => token.trim().toLowerCase().replace(/[^a-z0-9]/g, ''))
@@ -188,14 +217,31 @@ export function matchesJob(job, { query = '', where = '', source = 'all', boards
   return tokens.some((token) => company.includes(token))
 }
 
-/** Keep the first `limit` jobs of each portal. Call this after sorting. */
-export function capPerPortal(jobs, limit) {
-  const size = Number(limit) || jobs.length
-  const seen = new Map()
-  return jobs.filter((job) => {
-    const count = seen.get(job.portal) || 0
-    if (count >= size) return false
-    seen.set(job.portal, count + 1)
-    return true
-  })
+/** Why a non-empty result set is hidden, so a portal filter is not described as a date filter. */
+export function unmatchedReason(jobs, filters, portals = []) {
+  const matched = jobs.filter((job) => matchesJob(job, filters, portals))
+  const inRange = matched.filter((job) => isWithinRange(job, filters.dateRange))
+  if (inRange.length) return null
+  if (!jobs.length) {
+    return { title: 'No jobs matched', message: 'Try a different keyword, portal, or company.' }
+  }
+  if (filters.source && filters.source !== 'all') {
+    const fromPortal = jobs.filter((job) => portalKeyOf(job, portals) === filters.source)
+    if (!fromPortal.length) {
+      const label = portals.find((portal) => portal.key === filters.source)?.label || 'this portal'
+      return {
+        title: `No jobs from ${label}`,
+        message: 'Nothing from this portal is in the current results.',
+      }
+    }
+  }
+  const hiddenByDate = matched.filter((job) => !isWithinRange(job, filters.dateRange)).length
+  if (filters.dateRange !== 'any' && hiddenByDate > 0) {
+    const noun = hiddenByDate === 1 ? 'job is' : 'jobs are'
+    return {
+      title: 'No jobs in this date range',
+      message: `${hiddenByDate} ${noun} older than the selected range.`,
+    }
+  }
+  return { title: 'No jobs matched', message: 'Try a different keyword, portal, or company.' }
 }

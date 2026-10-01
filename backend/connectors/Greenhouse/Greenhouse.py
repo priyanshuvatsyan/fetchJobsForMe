@@ -15,6 +15,7 @@ from Server.api import (
     fetch_greenhouse_board,
     fetch_greenhouse_job,
     job_matches,
+    keeps_india_hybrid_or_remote,
     job_profile,
     load_boards,
     select_jobs,
@@ -128,7 +129,12 @@ class Greenhouse:
                     salary=_salary_from_metadata(item),
                     skill=_skills_from_metadata(item),
                 )
-                if not job.title or not job.url or not job_matches(job, query, where):
+                if (
+                    not job.title
+                    or not job.url
+                    or not job_matches(job, query, where)
+                    or not keeps_india_hybrid_or_remote(job.location)
+                ):
                     continue
                 jobs.append(job)
                 fresh.append(job)

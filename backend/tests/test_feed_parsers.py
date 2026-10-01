@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from Server.api import is_tech_role, to_datetime
+from Server.api import is_tech_role, keeps_india_hybrid_or_remote, to_datetime
 from connectors.FourDayWeek import FourDayWeek
 from connectors.Himalayas import Himalayas
 from connectors.Instahyre import Instahyre
@@ -137,6 +137,18 @@ class FeedParserTests(unittest.TestCase):
         self.assertTrue(is_tech_role("Solutions Architect"))
         self.assertFalse(is_tech_role("Non IT Recruiter"))
         self.assertFalse(is_tech_role("Production Engineer"))
+        self.assertTrue(keeps_india_hybrid_or_remote("Bengaluru, India (Hybrid)"))
+        self.assertTrue(keeps_india_hybrid_or_remote("Work From Home"))
+        self.assertTrue(keeps_india_hybrid_or_remote("United States (Remote)"))
+        self.assertTrue(keeps_india_hybrid_or_remote("Bangalore"))
+        self.assertTrue(keeps_india_hybrid_or_remote("Bengaluru"))
+        self.assertTrue(keeps_india_hybrid_or_remote("Mohali"))
+        self.assertTrue(keeps_india_hybrid_or_remote("Pimpri Chinchwad"))
+        self.assertTrue(keeps_india_hybrid_or_remote("Cochin (Hybrid)"))
+        self.assertTrue(keeps_india_hybrid_or_remote("Thane"))
+        self.assertFalse(keeps_india_hybrid_or_remote("Salem, Oregon, United States"))
+        self.assertFalse(keeps_india_hybrid_or_remote("San Francisco, California, United States (Hybrid)"))
+        self.assertFalse(keeps_india_hybrid_or_remote("Austin, TX"))
 
     def test_stop_keeps_jobs_already_saved(self):
         from Server.api import Job
@@ -174,9 +186,119 @@ class FeedParserTests(unittest.TestCase):
                 ["Software Engineer 0", "Software Engineer 1"],
             )
             self.assertEqual(len(get_store("stopdemo").read()), 2)
+            self.assertTrue(all(record.get("portalKey") == "stopdemo" for record in get_store("stopdemo").read()))
         finally:
             arm()
             get_store("stopdemo").path.unlink(missing_ok=True)
+
+    def test_flush_keeps_file_of_idle_store(self):
+        import json
+
+        from Server.feeds import get_store
+
+        store = get_store("flushdemo")
+        try:
+            store.path.write_text(json.dumps([{"role": "Kept"}]), encoding="utf-8")
+            store.flush()
+            self.assertEqual(json.loads(store.path.read_text(encoding="utf-8")), [{"role": "Kept"}])
+        finally:
+            store.path.unlink(missing_ok=True)
+
+    def test_portal_key_matches_every_label(self):
+        from Server.server import CONNECTORS, with_note_key, with_portal_key
+
+        labels = [cls.label.casefold() for cls in CONNECTORS]
+        self.assertEqual(len(labels), len(set(labels)))
+        for cls in CONNECTORS:
+            record = with_portal_key({"portal": cls.label, "role": "Engineer"})
+            self.assertEqual(record["portalKey"], cls.key)
+            note = with_note_key({"portal": cls.label, "message": "slow"})
+            self.assertEqual(note["portalKey"], cls.key)
+        week = with_portal_key({"portal": "4 Day Week"})
+        self.assertEqual(week["portalKey"], "fourdayweek")
+        kept = with_portal_key({"portal": "4 Day Week", "portalKey": "fourdayweek"})
+        self.assertIs(kept, with_portal_key(kept))
+
+    def test_saved_jobs_round_trip(self):
+        import tempfile
+        from pathlib import Path
+
+        import Server.server as server
+
+        original = server.SAVED_FILE
+        server.SAVED_FILE = Path(tempfile.mkdtemp()) / "saved_jobs.json"
+        try:
+            job = {
+                "portal": "4 Day Week",
+                "company": "JumpCloud",
+                "role": "Escalations Engineer",
+                "location": "Turkey (Remote)",
+                "link": "https://4dayweek.io/job/1",
+                "description": {"about company": "", "job description": "Fix things"},
+                "unexpected": "dropped",
+            }
+            stored = server.save_job(job)
+            self.assertEqual(stored["portalKey"], "fourdayweek")
+            self.assertTrue(stored["saved at"])
+            self.assertNotIn("unexpected", stored)
+            self.assertEqual(server.save_job(job)["saved at"], stored["saved at"])
+            self.assertEqual(len(server.read_saved()), 1)
+            with self.assertRaises(ValueError):
+                server.save_job({"role": "No link"})
+            self.assertTrue(server.unsave_job(job["link"]))
+            self.assertFalse(server.unsave_job(job["link"]))
+            self.assertEqual(server.read_saved(), [])
+        finally:
+            server.SAVED_FILE.unlink(missing_ok=True)
+            server.SAVED_FILE = original
+
+    def test_resume_import_and_manual_profile_update(self):
+        import base64
+        import tempfile
+        from pathlib import Path
+
+        import Server.server as server
+
+        root = Path(tempfile.mkdtemp())
+        original_profile, original_resume = server.PROFILE_FILE, server.RESUME_DIR
+        server.PROFILE_FILE, server.RESUME_DIR = root / "profile.json", root / "resume"
+        resume = """Shubhak Example
+Senior Backend Engineer
+shubhak@example.com | +91 9876543210
+https://linkedin.com/in/shubhak https://github.com/shubhak
+
+SUMMARY
+Backend engineer with 5 years of experience building Python and FastAPI services on AWS.
+
+EXPERIENCE
+Senior Backend Engineer, Acme
+Built REST APIs with PostgreSQL, Docker, Kubernetes and Kafka.
+
+EDUCATION
+B.Tech Computer Science, Example University
+"""
+        try:
+            result = server.upload_resume({
+                "filename": "resume.txt",
+                "content": base64.b64encode(resume.encode()).decode(),
+            })
+            profile = result["profile"]
+            self.assertEqual(profile["email"], "shubhak@example.com")
+            self.assertEqual(profile["totalExperience"], "5 years")
+            self.assertIn("Python", profile["skills"])
+            self.assertIn("FastAPI", profile["skills"])
+            self.assertEqual(profile["resume"]["filename"], "resume.txt")
+            updated = server.update_profile({
+                "targetRoles": ["Backend Engineer"],
+                "preferredLocations": ["Bengaluru", "Remote"],
+                "openToWork": True,
+            })
+            self.assertTrue(updated["openToWork"])
+            self.assertEqual(updated["targetRoles"], ["Backend Engineer"])
+            self.assertGreater(updated["completion"], profile["completion"])
+        finally:
+            server.PROFILE_FILE = original_profile
+            server.RESUME_DIR = original_resume
 
 
 if __name__ == "__main__":

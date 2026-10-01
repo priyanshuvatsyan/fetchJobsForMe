@@ -176,6 +176,240 @@ def clean(value) -> str:
     return " ".join(str(value or "").split())
 
 
+# Web fetches keep CSE/IT jobs from this window: India, Indian hybrid, or remote.
+POSTED_WINDOW_DAYS = 15
+
+_INDIA_MARKERS = (
+    "india",
+    "andhra pradesh",
+    "arunachal",
+    "assam",
+    "bihar",
+    "chhattisgarh",
+    "goa",
+    "gujarat",
+    "haryana",
+    "himachal",
+    "jharkhand",
+    "karnataka",
+    "kerala",
+    "madhya pradesh",
+    "maharashtra",
+    "manipur",
+    "meghalaya",
+    "mizoram",
+    "nagaland",
+    "odisha",
+    "punjab",
+    "rajasthan",
+    "sikkim",
+    "tamil nadu",
+    "telangana",
+    "tripura",
+    "uttar pradesh",
+    "uttarakhand",
+    "west bengal",
+    "delhi",
+    "chandigarh",
+    "puducherry",
+    "jammu",
+    "kashmir",
+    "ladakh",
+    "bengaluru",
+    "bangalore",
+    "hyderabad",
+    "mumbai",
+    "pune",
+    "chennai",
+    "noida",
+    "gurgaon",
+    "gurugram",
+    "kolkata",
+    "ahmedabad",
+    "jaipur",
+    "kochi",
+    "thiruvananthapuram",
+    "indore",
+    "lucknow",
+    "nagpur",
+    "coimbatore",
+    "vadodara",
+    "surat",
+    "bhopal",
+    "visakhapatnam",
+    "mysuru",
+    "mysore",
+    "kanpur",
+    "nashik",
+    "faridabad",
+    "ghaziabad",
+    "ncr",
+    "pimpri",
+    "chinchwad",
+    "thane",
+    "navi mumbai",
+    "mohali",
+    "panchkula",
+    "zirakpur",
+    "mangalore",
+    "mangaluru",
+    "trivandrum",
+    "cochin",
+    "calicut",
+    "kozhikode",
+    "ernakulam",
+    "kannur",
+    "kottayam",
+    "palakkad",
+    "kollam",
+    "madurai",
+    "coimbatore",
+    "salem",
+    "tiruppur",
+    "vellore",
+    "erode",
+    "dindigul",
+    "tiruchirappalli",
+    "trichy",
+    "amravati",
+    "raipur",
+    "bhubaneswar",
+    "bhubaneshwar",
+    "kolhapur",
+    "vijayawada",
+    "ludhiana",
+    "solapur",
+    "gandhinagar",
+    "nellore",
+    "panaji",
+    "panjim",
+    "dehradun",
+    "udaipur",
+    "guwahati",
+    "varanasi",
+    "dharwad",
+    "rohtak",
+    "vapi",
+    "vijayapura",
+    "tirupati",
+    "rajkot",
+    "bikaner",
+    "karnal",
+    "kota",
+    "meerut",
+    "jamshedpur",
+    "guntur",
+    "srikakulam",
+    "kadapa",
+    "vasai",
+    "jabalpur",
+    "nagercoil",
+    "siliguri",
+    "jodhpur",
+    "roorkee",
+    "vizianagaram",
+    "vishakhapatnam",
+    "ajmer",
+    "solan",
+    "bareilly",
+    "kurnool",
+    "aligarh",
+    "bhavnagar",
+    "malappuram",
+    "baddi",
+    "patna",
+    "ranchi",
+    "jalandhar",
+    "amritsar",
+    "agra",
+    "prayagraj",
+    "allahabad",
+    "aurangabad",
+    "hubli",
+    "hubballi",
+    "belgaum",
+    "belagavi",
+    "warangal",
+    "pondicherry",
+    "cuttack",
+    "rourkela",
+    "howrah",
+    "durgapur",
+    "gwalior",
+    "ujjain",
+    "haridwar",
+    "shimla",
+    "patiala",
+    "ambala",
+    "panipat",
+    "sonipat",
+    "manesar",
+    "secunderabad",
+    "gachibowli",
+    "madhapur",
+    "kondapur",
+    "hinjewadi",
+    "whitefield",
+    "bombay",
+    "madras",
+    "calcutta",
+    "baroda",
+    "poona",
+)
+# A bare "Salem" on Indian boards is Salem, Tamil Nadu. The same word in a US address is not.
+_AMBIGUOUS_INDIA = {"salem"}
+_FOREIGN_COUNTRY = (
+    "united states",
+    "united kingdom",
+    "u.s.a",
+    "usa",
+    "canada",
+    "australia",
+    "germany",
+    "france",
+    "ireland",
+    "singapore",
+)
+_REMOTE_MARKERS = ("remote", "work from home", "wfh", "anywhere", "worldwide")
+
+
+def _mentions(text: str, marker: str) -> bool:
+    return re.search(rf"(?<![a-z0-9]){re.escape(marker)}(?![a-z0-9])", text) is not None
+
+
+def in_india(location: str) -> bool:
+    """True when the text names India or an Indian city, even without the word India."""
+    text = (location or "").casefold()
+    hits = [marker for marker in _INDIA_MARKERS if _mentions(text, marker)]
+    if not hits:
+        return False
+    if any(marker not in _AMBIGUOUS_INDIA for marker in hits):
+        return True
+    return not any(country in text for country in _FOREIGN_COUNTRY)
+
+
+def keeps_india_hybrid_or_remote(location: str) -> bool:
+    """India (including Indian hybrid) or a remote role anywhere."""
+    text = (location or "").casefold()
+    if not text:
+        return False
+    if any(_mentions(text, marker) for marker in _REMOTE_MARKERS):
+        return True
+    return in_india(text)
+
+
+def visible_record(record: dict, window_days: int = POSTED_WINDOW_DAYS) -> bool:
+    """Saved rows shown on the jobs page: tech, India/hybrid/remote, inside the window."""
+    if not isinstance(record, dict) or not is_tech_role(record.get("role", "")):
+        return False
+    if not keeps_india_hybrid_or_remote(record.get("location") or ""):
+        return False
+    posted = record.get("added on") or ""
+    if posted and window_days and not within_days(posted, window_days):
+        return False
+    return True
+
+
 def within_days(posted_at: str, days: int) -> bool:
     """True when a portal timestamp falls inside the last `days` days."""
     if not posted_at or days <= 0:
