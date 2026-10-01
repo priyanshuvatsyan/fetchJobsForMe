@@ -153,7 +153,12 @@ const JobCard = ({ job, defaultExpanded = false, saved = false, onToggleSave }) 
 
       {hasDescription && expanded ? (
         <div className="job-card-panel" id={panelId}>
-          <JobDescription aboutCompany={job.aboutCompany} jobDescription={job.jobDescription} />
+          <JobDescription
+            aboutCompany={job.aboutCompany}
+            jobDescription={job.jobDescription}
+            openings={job.openings}
+            applicants={job.applicants}
+          />
         </div>
       ) : null}
     </article>

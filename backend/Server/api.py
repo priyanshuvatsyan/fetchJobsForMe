@@ -61,6 +61,8 @@ class Job:
     salary: str = ""
     about_company: str = ""
     job_description: str = ""
+    openings: str = ""
+    applicants: str = ""
 
 
 _YEARS = re.compile(

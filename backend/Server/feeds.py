@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -18,6 +20,102 @@ def _event(portal: str, level: str, message: str) -> None:
     event(portal, level, message)
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+_ROLE_ALIASES = {
+    "ml": ("machine learning", "ml engineer", "mlops"),
+    "ai": ("artificial intelligence", "ai engineer", "generative ai"),
+    "qa": ("quality assurance", "qa engineer", "testing"),
+    "sre": ("site reliability", "sre"),
+    "devops": ("devops", "dev ops"),
+}
+
+
+def experience_cap(value) -> int | None:
+    """None means every experience level. 0–5 is the maximum years a job may require."""
+    if value is None:
+        return None
+    text = str(value).strip().casefold()
+    if text in {"", "all", "select", "none"}:
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if 0 <= number <= 5:
+        return number
+    return None
+
+
+def _term_in(haystack: str, term: str) -> bool:
+    """Match a role phrase. Short codes such as ML or AI must be whole words, not letters inside another word."""
+    term = term.casefold().strip()
+    if not term:
+        return False
+    if " " in term or len(term) > 3:
+        return term in haystack
+    return re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", haystack) is not None
+
+
+def search_phrases(roles: list[str] | None) -> list[str]:
+    """Words to send to a job search. ML also searches Machine Learning, ML Engineer, and MLOps."""
+    phrases: list[str] = []
+    seen: set[str] = set()
+    for role in roles or []:
+        value = str(role).strip()
+        if not value:
+            continue
+        for phrase in (value, *_ROLE_ALIASES.get(value.casefold(), ())):
+            key = phrase.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            phrases.append(phrase)
+    return phrases
+
+
+def role_matches(title: str, skill: str, roles: list[str] | None) -> bool:
+    """An empty role list keeps every CSE/IT job. Saved roles match the title or skills."""
+    phrases = search_phrases(roles)
+    if not phrases:
+        return True
+    haystack = f"{title} {skill}".casefold()
+    return any(_term_in(haystack, phrase) for phrase in phrases)
+
+
+def _minimum_experience(experience: str, title: str) -> int | None:
+    numbers = [int(value) for value in re.findall(r"\d{1,2}", experience or "")]
+    if numbers:
+        return min(numbers)
+    folded = f"{experience} {title}".casefold()
+    for words, years in (
+        (("intern", "fresher", "graduate", "entry level", "trainee"), 0),
+        (("junior",), 1),
+        (("mid level", "intermediate"), 2),
+        (("senior",), 3),
+        (("lead", "staff", "principal", "architect", "manager"), 5),
+    ):
+        if any(word in folded for word in words):
+            return years
+    return None
+
+
+def _matches_saved_search(job: Job, maximum: int | None, roles: list[str]) -> bool:
+    minimum = _minimum_experience(job.experience, job.title)
+    cap = experience_cap(maximum)
+    if cap is not None and minimum is not None and minimum > cap:
+        return False
+    return role_matches(job.title, job.skill, roles)
+
+
+def _description(job: Job) -> dict:
+    description = {
+        "about company": job.about_company,
+        "job description": job.job_description,
+    }
+    if job.openings:
+        description["openings"] = job.openings
+    if job.applicants:
+        description["applicants"] = job.applicants
+    return description
 
 
 def job_record(job: Job, portal_key: str = "") -> dict:
@@ -31,10 +129,7 @@ def job_record(job: Job, portal_key: str = "") -> dict:
         "salary": job.salary,
         "added on": job.posted_at,
         "location": job.location,
-        "description": {
-            "about company": job.about_company,
-            "job description": job.job_description,
-        },
+        "description": _description(job),
         "link": job.url,
     }
 
@@ -143,8 +238,13 @@ class SidecarConnector:
         boards: list[str] | None = None,
         on_batch=None,
         posted_within_days: int | None = None,
+        max_experience: int | None = None,
+        role_terms: list[str] | None = None,
     ) -> list[Job]:
         del boards
+        self.max_experience = max_experience
+        self.role_terms = list(role_terms or [])
+        self.search_phrases = search_phrases(self.role_terms)
         store = get_store(self.key)
         started = current_token()
         epoch = store.reset()
@@ -174,6 +274,8 @@ class SidecarConnector:
                     and job.posted_at
                     and not within_days(job.posted_at, posted_within_days)
                 ):
+                    continue
+                if not _matches_saved_search(job, max_experience, self.role_terms):
                     continue
                 if location_query and location_query not in (
                     f"{job.title} {job.company} {job.location}".casefold()
@@ -211,14 +313,15 @@ class FeedCoordinator:
         self._warnings: dict[str, list[str]] = {}
         self._errors: dict[str, str] = {}
         self._timings: dict[str, float] = {}
+        self._settings: dict[str, dict] = {}
         self._announced: set[str] = set()
         self.suppressed = False
 
-    def start_all(self, refresh: bool) -> None:
+    def start_all(self, refresh: bool, preferences: dict | None = None) -> None:
         for key in self.connectors:
-            self.start(key, refresh)
+            self.start(key, refresh, preferences)
 
-    def start(self, key: str, refresh: bool) -> None:
+    def start(self, key: str, refresh: bool, preferences: dict | None = None) -> None:
         connector_class = self.connectors.get(key)
         if connector_class is None:
             return
@@ -239,6 +342,7 @@ class FeedCoordinator:
                 return
             self._running.add(key)
             self._run_tokens[key] = run_token
+            self._settings[key] = dict(preferences or {})
         threading.Thread(
             target=self._worker,
             args=(connector_class, run_token),
@@ -261,7 +365,14 @@ class FeedCoordinator:
         jobs: list[Job] = []
         _event(key, "info", f"start window={self.window_days}")
         try:
-            kwargs = {"limit": 0, "posted_within_days": self.window_days}
+            preferences = self._settings.get(key) or {}
+            window_days = int(preferences.get("windowDays") or self.window_days)
+            kwargs = {"limit": 0, "posted_within_days": window_days}
+            accepted = inspect.signature(connector.fetch).parameters
+            if "max_experience" in accepted:
+                kwargs["max_experience"] = experience_cap(preferences.get("experience"))
+            if "role_terms" in accepted:
+                kwargs["role_terms"] = list(preferences.get("roles") or [])
             if key == "linkedin":
                 kwargs["open_browser"] = False
             jobs = connector.fetch(**kwargs)
