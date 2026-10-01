@@ -10,17 +10,22 @@ Examples (from the project root):
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import io
 import json
 import logging
 import re
 import sys
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from xml.etree import ElementTree
 
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
@@ -672,6 +677,285 @@ def unsave_job(link: str) -> bool:
     return True
 
 
+# Candidate profile and resume. The profile is deliberately provider-neutral so
+# recommendations, applications, and future agents can all consume one schema.
+PROFILE_FILE = JOBS_FILE.parent / "profile.json"
+RESUME_DIR = JOBS_FILE.parent / "resume"
+MAX_RESUME_BYTES = 8 * 1024 * 1024
+_profile_lock = threading.Lock()
+_PROFILE_TEXT_FIELDS = (
+    "fullName", "email", "phone", "headline", "summary", "currentTitle",
+    "currentCompany", "totalExperience", "noticePeriod", "expectedSalary",
+    "salaryCurrency", "linkedin", "github", "portfolio", "workAuthorization",
+    "education", "experienceHistory",
+)
+_PROFILE_LIST_FIELDS = (
+    "skills", "targetRoles", "preferredLocations", "workModes", "employmentTypes",
+)
+_PROFILE_BOOL_FIELDS = ("openToWork", "willingToRelocate")
+_SKILL_TERMS = (
+    "Python", "Java", "JavaScript", "TypeScript", "React", "Angular", "Vue",
+    "Node.js", "Express", "Django", "Flask", "FastAPI", "Spring Boot", ".NET",
+    "C", "C++", "C#", "Go", "Rust", "Kotlin", "Swift", "PHP", "Ruby",
+    "SQL", "MySQL", "PostgreSQL", "MongoDB", "Redis", "Oracle", "Snowflake",
+    "AWS", "Azure", "GCP", "Docker", "Kubernetes", "Terraform", "Jenkins",
+    "Git", "Linux", "REST", "GraphQL", "Kafka", "Spark", "Hadoop", "Airflow",
+    "Machine Learning", "Deep Learning", "NLP", "TensorFlow", "PyTorch",
+    "Pandas", "NumPy", "Data Analysis", "Power BI", "Tableau", "Selenium",
+    "Cypress", "Playwright", "API Testing", "Agile", "Scrum", "DevOps",
+    "Microservices", "System Design", "Data Structures", "Algorithms",
+)
+
+
+def _empty_profile() -> dict:
+    profile = {field: "" for field in _PROFILE_TEXT_FIELDS}
+    profile.update({field: [] for field in _PROFILE_LIST_FIELDS})
+    profile.update({field: False for field in _PROFILE_BOOL_FIELDS})
+    profile.update({
+        "resume": None,
+        "updatedAt": "",
+    })
+    return profile
+
+
+def _profile_completion(profile: dict) -> int:
+    important = (
+        "fullName", "email", "phone", "headline", "summary", "currentTitle",
+        "totalExperience", "skills", "targetRoles", "preferredLocations",
+        "workModes", "education", "experienceHistory", "resume",
+    )
+    complete = sum(bool(profile.get(field)) for field in important)
+    return round(complete * 100 / len(important))
+
+
+def read_profile() -> dict:
+    profile = _empty_profile()
+    try:
+        payload = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    if isinstance(payload, dict):
+        for field in _PROFILE_TEXT_FIELDS:
+            if isinstance(payload.get(field), str):
+                profile[field] = payload[field]
+        for field in _PROFILE_LIST_FIELDS:
+            if isinstance(payload.get(field), list):
+                profile[field] = [str(item).strip() for item in payload[field] if str(item).strip()]
+        for field in _PROFILE_BOOL_FIELDS:
+            profile[field] = bool(payload.get(field))
+        if isinstance(payload.get("resume"), dict):
+            profile["resume"] = payload["resume"]
+        profile["updatedAt"] = str(payload.get("updatedAt") or "")
+    profile["completion"] = _profile_completion(profile)
+    return profile
+
+
+def update_profile(changes: dict) -> dict:
+    if not isinstance(changes, dict):
+        raise ValueError("profile must be an object")
+    with _profile_lock:
+        profile = read_profile()
+        for field in _PROFILE_TEXT_FIELDS:
+            if field in changes:
+                profile[field] = str(changes[field] or "").strip()[:10_000]
+        for field in _PROFILE_LIST_FIELDS:
+            if field not in changes:
+                continue
+            value = changes[field]
+            if not isinstance(value, list):
+                raise ValueError(f"{field} must be a list")
+            profile[field] = list(dict.fromkeys(
+                str(item).strip()[:120] for item in value if str(item).strip()
+            ))[:100]
+        for field in _PROFILE_BOOL_FIELDS:
+            if field in changes:
+                profile[field] = bool(changes[field])
+        profile["updatedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        profile.pop("completion", None)
+        _write_json(PROFILE_FILE, profile)
+    event("profile", "info", "profile updated")
+    return read_profile()
+
+
+def _resume_text(content: bytes, suffix: str) -> str:
+    if suffix == ".txt":
+        return content.decode("utf-8", errors="replace")
+    if suffix == ".docx":
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                xml = archive.read("word/document.xml")
+            root = ElementTree.fromstring(xml)
+        except (KeyError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+            raise ValueError("invalid DOCX resume") from exc
+        paragraphs = []
+        for paragraph in root.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"):
+            text = "".join(
+                node.text or ""
+                for node in paragraph.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t")
+            ).strip()
+            if text:
+                paragraphs.append(text)
+        return "\n".join(paragraphs)
+    if suffix == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError as exc:
+            raise ValueError("PDF parsing requires the pypdf package from backend/requirements.txt") from exc
+        try:
+            reader = PdfReader(io.BytesIO(content), strict=False)
+            if reader.is_encrypted:
+                reader.decrypt("")
+            pages = []
+            for page in reader.pages:
+                pages.append(page.extract_text() or "")
+            text = "\n".join(pages).strip()
+            if not text:
+                raise ValueError("This PDF has no selectable text. Export it as DOCX, or upload a text-based PDF.")
+            return text
+        except ValueError:
+            raise
+        except Exception as exc:
+            event("profile", "error", f"pdf parse failed: {exc}")
+            raise ValueError(
+                "This PDF could not be read. Export it as DOCX, or use a PDF with selectable text."
+            ) from exc
+    raise ValueError("resume must be a PDF, DOCX, or TXT file")
+
+
+def _section(text: str, headings: tuple[str, ...], stops: tuple[str, ...]) -> str:
+    lines = [line.strip() for line in text.splitlines()]
+    start = next(
+        (index + 1 for index, line in enumerate(lines) if line.casefold().rstrip(":") in headings),
+        None,
+    )
+    if start is None:
+        return ""
+    selected = []
+    for line in lines[start:]:
+        folded = line.casefold().rstrip(":")
+        if folded in stops:
+            break
+        selected.append(line)
+    return "\n".join(selected).strip()[:10_000]
+
+
+def parse_resume(text: str) -> dict:
+    """Conservative, deterministic resume extraction. The user reviews every result."""
+    text = text.replace("\x00", " ")
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    joined = "\n".join(lines)
+    email = re.search(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", joined)
+    phone = re.search(r"(?<!\d)(?:\+?91[\s-]?)?[6-9]\d{9}(?!\d)", re.sub(r"[() ]", "", joined))
+    urls = re.findall(r"https?://[^\s|,;]+|(?:linkedin\.com|github\.com)/[^\s|,;]+", joined, re.I)
+
+    name = ""
+    for line in lines[:8]:
+        if "@" in line or re.search(r"\d{6,}", line) or "http" in line.casefold():
+            continue
+        words = line.split()
+        if 2 <= len(words) <= 5 and len(line) <= 70:
+            name = line
+            break
+
+    title = ""
+    start = lines.index(name) + 1 if name in lines else 0
+    for line in lines[start:start + 6]:
+        if "@" not in line and not re.search(r"\d{6,}", line) and len(line) <= 100:
+            title = line
+            break
+
+    skills = [
+        skill for skill in _SKILL_TERMS
+        if re.search(rf"(?<![a-z0-9]){re.escape(skill.casefold())}(?![a-z0-9])", joined.casefold())
+    ]
+    years = re.findall(r"(\d{1,2}(?:\.\d+)?)\s*\+?\s*years?", joined, re.I)
+    numeric_years = [float(value) for value in years if float(value) <= 50]
+    total_experience = f"{max(numeric_years):g} years" if numeric_years else ""
+    linkedin = next((url for url in urls if "linkedin.com" in url.casefold()), "")
+    github = next((url for url in urls if "github.com" in url.casefold()), "")
+    portfolio = next((url for url in urls if url not in {linkedin, github}), "")
+    all_headings = (
+        "experience", "work experience", "professional experience", "employment",
+        "education", "academic background", "qualifications", "skills",
+        "technical skills", "projects", "certifications", "summary", "profile",
+    )
+    experience = _section(
+        joined,
+        ("experience", "work experience", "professional experience", "employment"),
+        all_headings,
+    )
+    education = _section(
+        joined,
+        ("education", "academic background", "qualifications"),
+        all_headings,
+    )
+    summary = _section(joined, ("summary", "profile", "professional summary"), all_headings)
+    return {
+        "fullName": name,
+        "email": email.group(0) if email else "",
+        "phone": phone.group(0) if phone else "",
+        "headline": title,
+        "currentTitle": title,
+        "summary": summary,
+        "totalExperience": total_experience,
+        "skills": skills,
+        "linkedin": linkedin,
+        "github": github,
+        "portfolio": portfolio,
+        "education": education,
+        "experienceHistory": experience,
+    }
+
+
+def upload_resume(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("resume payload must be an object")
+    filename = Path(str(payload.get("filename") or "")).name
+    suffix = Path(filename).suffix.casefold()
+    encoded = payload.get("content")
+    if not isinstance(encoded, str):
+        raise ValueError("resume content is required")
+    try:
+        content = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("resume content must be base64") from exc
+    if not content:
+        raise ValueError("resume is empty")
+    if len(content) > MAX_RESUME_BYTES:
+        raise ValueError("resume must be 8 MB or smaller")
+
+    text = _resume_text(content, suffix)
+    if len(text.strip()) < 20:
+        raise ValueError("could not extract enough text from this resume")
+    extracted = parse_resume(text)
+    RESUME_DIR.mkdir(parents=True, exist_ok=True)
+    for old in RESUME_DIR.glob("resume.*"):
+        old.unlink(missing_ok=True)
+    resume_path = RESUME_DIR / f"resume{suffix}"
+    resume_path.write_bytes(content)
+
+    with _profile_lock:
+        profile = read_profile()
+        # A new resume refreshes fields it can identify and preserves preferences
+        # such as locations, work modes, salary, and manually entered values it cannot.
+        for field, value in extracted.items():
+            if value:
+                profile[field] = value
+        uploaded = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        profile["resume"] = {
+            "filename": filename,
+            "size": len(content),
+            "uploadedAt": uploaded,
+            "type": suffix.lstrip(".").upper(),
+        }
+        profile["updatedAt"] = uploaded
+        profile.pop("completion", None)
+        _write_json(PROFILE_FILE, profile)
+    event("profile", "info", f"resume uploaded filename={filename} bytes={len(content)}")
+    return {"profile": read_profile(), "extracted": extracted}
+
+
 SNAPSHOT_VERSION = 3
 
 
@@ -980,7 +1264,7 @@ def jobs_summary() -> dict:
 class JobsApiHandler(BaseHTTPRequestHandler):
     """JSON API for the web app. Jobs are read-only; saved jobs accept POST and DELETE."""
 
-    max_body = 1_000_000
+    max_body = 12 * 1024 * 1024
 
     server_version = "fetchJobsForMe"
     country = "in"
@@ -1009,6 +1293,9 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         if route.path == "/api/summary":
             self._send_json(200, jobs_summary())
             return
+        if route.path == "/api/profile":
+            self._send_json(200, {"profile": read_profile()})
+            return
         if route.path != "/api/jobs":
             self._send_json(404, {"error": f"unknown path {route.path}"})
             return
@@ -1030,8 +1317,20 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         self._send_json(200, payload)
 
     def do_POST(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
-        if urlparse(self.path).path != "/api/saved":
-            self._send_json(404, {"error": f"unknown path {urlparse(self.path).path}"})
+        path = urlparse(self.path).path
+        if path == "/api/resume":
+            body = self._read_json()
+            if body is None:
+                return
+            try:
+                result = upload_resume(body)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            self._send_json(200, result)
+            return
+        if path != "/api/saved":
+            self._send_json(404, {"error": f"unknown path {path}"})
             return
         body = self._read_json()
         if body is None:
@@ -1042,6 +1341,21 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": str(exc)})
             return
         self._send_json(201, {"job": job, "count": len(read_saved())})
+
+    def do_PUT(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+        path = urlparse(self.path).path
+        if path != "/api/profile":
+            self._send_json(404, {"error": f"unknown path {path}"})
+            return
+        body = self._read_json()
+        if body is None:
+            return
+        try:
+            profile = update_profile(body.get("profile") if isinstance(body, dict) else None)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        self._send_json(200, {"profile": profile})
 
     def do_DELETE(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
         route = urlparse(self.path)
@@ -1076,7 +1390,7 @@ class JobsApiHandler(BaseHTTPRequestHandler):
     def _send_cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 
     def _send_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")

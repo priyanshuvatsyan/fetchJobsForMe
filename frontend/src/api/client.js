@@ -47,6 +47,7 @@ async function request(method, path, { params = {}, body, signal } = {}) {
 
 export const getJson = (path, options) => request('GET', path, options)
 export const postJson = (path, body, options = {}) => request('POST', path, { ...options, body })
+export const putJson = (path, body, options = {}) => request('PUT', path, { ...options, body })
 export const deleteJson = (path, options) => request('DELETE', path, options)
 
 export { BASE_URL }

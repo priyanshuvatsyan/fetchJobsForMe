@@ -252,6 +252,54 @@ class FeedParserTests(unittest.TestCase):
             server.SAVED_FILE.unlink(missing_ok=True)
             server.SAVED_FILE = original
 
+    def test_resume_import_and_manual_profile_update(self):
+        import base64
+        import tempfile
+        from pathlib import Path
+
+        import Server.server as server
+
+        root = Path(tempfile.mkdtemp())
+        original_profile, original_resume = server.PROFILE_FILE, server.RESUME_DIR
+        server.PROFILE_FILE, server.RESUME_DIR = root / "profile.json", root / "resume"
+        resume = """Shubhak Example
+Senior Backend Engineer
+shubhak@example.com | +91 9876543210
+https://linkedin.com/in/shubhak https://github.com/shubhak
+
+SUMMARY
+Backend engineer with 5 years of experience building Python and FastAPI services on AWS.
+
+EXPERIENCE
+Senior Backend Engineer, Acme
+Built REST APIs with PostgreSQL, Docker, Kubernetes and Kafka.
+
+EDUCATION
+B.Tech Computer Science, Example University
+"""
+        try:
+            result = server.upload_resume({
+                "filename": "resume.txt",
+                "content": base64.b64encode(resume.encode()).decode(),
+            })
+            profile = result["profile"]
+            self.assertEqual(profile["email"], "shubhak@example.com")
+            self.assertEqual(profile["totalExperience"], "5 years")
+            self.assertIn("Python", profile["skills"])
+            self.assertIn("FastAPI", profile["skills"])
+            self.assertEqual(profile["resume"]["filename"], "resume.txt")
+            updated = server.update_profile({
+                "targetRoles": ["Backend Engineer"],
+                "preferredLocations": ["Bengaluru", "Remote"],
+                "openToWork": True,
+            })
+            self.assertTrue(updated["openToWork"])
+            self.assertEqual(updated["targetRoles"], ["Backend Engineer"])
+            self.assertGreater(updated["completion"], profile["completion"])
+        finally:
+            server.PROFILE_FILE = original_profile
+            server.RESUME_DIR = original_resume
+
 
 if __name__ == "__main__":
     unittest.main()
