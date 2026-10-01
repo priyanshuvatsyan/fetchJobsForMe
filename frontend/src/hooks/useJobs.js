@@ -6,7 +6,6 @@ const EMPTY = {
   portals: [],
   credits: [],
   notes: [],
-  linkedinSearchUrl: '',
   loading: false,
   fetchedAt: '',
 }

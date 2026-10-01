@@ -7,6 +7,7 @@ from Server.api import (
     extract_salary,
     fetch_lever_postings,
     job_matches,
+    keeps_india_hybrid_or_remote,
     job_profile,
     load_boards,
     split_description,
@@ -104,7 +105,9 @@ class Lever:
                         job_description=job_description,
                     )
                 )
-                if not job_matches(jobs[-1], query, where):
+                if not job_matches(jobs[-1], query, where) or not keeps_india_hybrid_or_remote(
+                    jobs[-1].location
+                ):
                     jobs.pop()
             if on_batch is not None and len(jobs) > start:
                 on_batch(jobs[start:])

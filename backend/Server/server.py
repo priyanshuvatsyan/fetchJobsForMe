@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
 import threading
@@ -25,7 +26,38 @@ BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-from Server.api import Job, is_tech_role, within_days
+_LOGGER = logging.getLogger("fetchjobs")
+_LOG_ENABLED = False
+
+
+def enable() -> None:
+    """Send INFO, WARNING, and ERROR lines to stdout. Safe to call twice.
+
+    Stays off for the terminal CLI so printed JSON is unchanged. A line looks like:
+    2026-10-01 02:20:01 INFO [fourdayweek] start window=15
+    """
+    global _LOG_ENABLED
+    _LOG_ENABLED = True
+    if _LOGGER.handlers:
+        return
+    _LOGGER.setLevel(logging.INFO)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    _LOGGER.addHandler(handler)
+    _LOGGER.propagate = False
+
+
+def event(portal: str, level: str, message: str) -> None:
+    """Log one portal lifecycle line. No-op until enable() runs."""
+    if not _LOG_ENABLED:
+        return
+    numeric = getattr(logging, (level or "info").upper(), logging.INFO)
+    _LOGGER.log(numeric, "[%s] %s", portal or "-", message)
+
+
+from Server.api import POSTED_WINDOW_DAYS, Job, is_tech_role, keeps_india_hybrid_or_remote, within_days
 from Server.control import arm, cancel, held
 from Server.feeds import FeedCoordinator
 from connectors.Adzuna import Adzuna
@@ -71,8 +103,8 @@ CONNECTORS = [
 BY_KEY = {connector.key: connector for connector in CONNECTORS}
 
 # Last successful "all portals" fetch. The jobs page reads this on startup.
-# Web fetches keep every opening from the last 30 days, with no per-portal cap.
-WINDOW_DAYS = 30
+# Web fetches keep India, Indian hybrid, and remote openings from this window.
+WINDOW_DAYS = POSTED_WINDOW_DAYS
 JOBS_FILE = Path(__file__).resolve().parents[1] / "data" / "jobs.json"
 _jobs_lock = threading.Lock()
 # In-memory fetch. The jobs page reads this while portals are still running.
@@ -84,7 +116,6 @@ _progress = {
     "notes": [],
     "note_keys": set(),
     "credits": [],
-    "linkedin": "",
     "error": "",
     "fetchedAt": "",
     "last_write": 0.0,
@@ -177,6 +208,33 @@ def run_connector(
     posted_within_days: int | None = None,
     publish=None,
 ):
+    started = time.perf_counter()
+    event(cls.key, "info", "start")
+    try:
+        connector, jobs = _run_connector(
+            cls, query, where, limit, boards, country, open_browser, posted_within_days, publish,
+        )
+    except Exception as exc:
+        event(cls.key, "error", f"fetch failed: {exc}")
+        raise
+    for warning in getattr(connector, "warnings", []):
+        event(cls.key, "warning", warning)
+    elapsed = round(time.perf_counter() - started, 1)
+    event(cls.key, "info", f"done jobs={len(jobs)} seconds={elapsed}")
+    return connector, jobs
+
+
+def _run_connector(
+    cls: type,
+    query: str,
+    where: str,
+    limit: int,
+    boards: list[str] | None,
+    country: str,
+    open_browser: bool,
+    posted_within_days: int | None = None,
+    publish=None,
+):
     connector = make_connector(cls, country)
     site_boards = boards if cls.key in SLUG_SOURCES else None
     streamed = False
@@ -184,7 +242,11 @@ def run_connector(
     def on_batch(batch: list[Job]) -> None:
         nonlocal streamed
         streamed = True
-        batch = [job for job in batch if is_tech_role(job.title)]
+        batch = [
+            job
+            for job in batch
+            if is_tech_role(job.title) and keeps_india_hybrid_or_remote(job.location)
+        ]
         if publish is not None and batch:
             publish(connector, batch)
 
@@ -206,7 +268,11 @@ def run_connector(
         jobs = connector.fetch(**kwargs, open_browser=open_browser)
     else:
         jobs = connector.fetch(**kwargs)
-    jobs = [job for job in jobs if is_tech_role(job.title)]
+    jobs = [
+        job
+        for job in jobs
+        if is_tech_role(job.title) and keeps_india_hybrid_or_remote(job.location)
+    ]
     if posted_within_days:
         jobs = [
             job
@@ -383,7 +449,7 @@ def sort_jobs(jobs: list[Job], specs: list[tuple[str, bool]]) -> list[Job]:
     return ordered
 
 
-def job_record(job: Job, include_portal: bool) -> dict:
+def job_record(job: Job, include_portal: bool, portal_key: str = "") -> dict:
     record = {
         "company": job.company,
         "role": job.title,
@@ -399,7 +465,7 @@ def job_record(job: Job, include_portal: bool) -> dict:
         "link": job.url,
     }
     if include_portal:
-        record = {"portal": job.source, **record}
+        record = {"portal": job.source, "portalKey": portal_key, **record}
     return record
 
 
@@ -542,61 +608,7 @@ def write_jobs_file(payload: dict) -> None:
         print(f"  could not save {JOBS_FILE.name}: {exc}")
 
 
-def jobs_payload(
-    source: str,
-    query: str,
-    where: str,
-    limit: int,
-    boards: list[str] | None,
-    country: str,
-    sort: str,
-    posted_within_days: int | None = None,
-) -> dict:
-    """Fetch jobs for the web app: the same data the terminal prints."""
-    sources = selected_sources(source)
-    sort_specs = parse_sort(sort)
-    results = run_sources(
-        sources,
-        query,
-        where,
-        limit,
-        boards,
-        country,
-        open_browser=False,
-        posted_within_days=posted_within_days,
-    )
-
-    jobs: list[Job] = []
-    notes: list[dict] = []
-    credits: list[str] = []
-    linkedin_url = ""
-    for connector, portal_jobs in results:
-        jobs.extend(portal_jobs)
-        credit = CREDITS.get(connector.key)
-        if credit and portal_jobs:
-            credits.append(credit)
-        for warning in connector.warnings:
-            notes.append({"portal": connector.label, "message": warning})
-        if connector.key == "linkedin":
-            linkedin_url = getattr(connector, "search_url", "")
-
-    ordered = sort_jobs(jobs, sort_specs)
-    return {
-        "source": source,
-        "query": query,
-        "where": where,
-        "limit": limit,
-        "count": len(ordered),
-        "jobs": [job_record(job, include_portal=True) for job in ordered],
-        "portals": [{"key": cls.key, "label": cls.label} for cls in CONNECTORS],
-        "credits": credits,
-        "notes": notes,
-        "linkedinSearchUrl": linkedin_url,
-        "windowDays": posted_within_days or 0,
-    }
-
-
-SNAPSHOT_VERSION = 2
+SNAPSHOT_VERSION = 3
 
 
 def _snapshot_current(saved: dict) -> bool:
@@ -608,7 +620,69 @@ def _snapshot_current(saved: dict) -> bool:
 
 
 def _portal_list() -> list[dict]:
-    return [{"key": cls.key, "label": cls.label} for cls in CONNECTORS]
+    return _portal_catalog()
+
+
+_LABEL_TO_KEY = {cls.label.casefold(): cls.key for cls in CONNECTORS}
+
+
+def with_portal_key(record: dict) -> dict:
+    """Attach the stable portal id. Saved rows that only have a display name still match."""
+    if not isinstance(record, dict):
+        return record
+    key = (record.get("portalKey") or "").strip()
+    if not key:
+        key = _LABEL_TO_KEY.get((record.get("portal") or "").strip().casefold(), "")
+    if not key or record.get("portalKey") == key:
+        return record
+    return {**record, "portalKey": key}
+
+
+def with_note_key(note: dict) -> dict:
+    if not isinstance(note, dict):
+        return note
+    key = (note.get("portalKey") or "").strip()
+    if not key:
+        key = _LABEL_TO_KEY.get((note.get("portal") or "").strip().casefold(), "")
+    if not key or note.get("portalKey") == key:
+        return note
+    return {**note, "portalKey": key}
+
+
+def _portal_catalog() -> list[dict]:
+    """One row per portal: the id the UI filters on, plus live status for logs and later screens."""
+    live = FEED_COORDINATOR.status()
+    main_running = bool(_progress.get("running"))
+    catalog = []
+    for cls in CONNECTORS:
+        info = live.get(cls.key, {})
+        if cls.key in PAUSED_SIDECAR_KEYS:
+            status = "paused"
+        elif info.get("running"):
+            status = "running"
+        elif getattr(cls, "persist", "") != "sidecar" and main_running:
+            status = "running"
+        elif info.get("error"):
+            status = "error"
+        else:
+            status = "idle"
+        catalog.append({
+            "key": cls.key,
+            "label": cls.label,
+            "status": status,
+            "warnings": list(info.get("warnings") or []),
+            "error": info.get("error") or "",
+            "seconds": info.get("seconds"),
+        })
+    return catalog
+
+
+def _respond(payload: dict) -> dict:
+    merged = FEED_COORDINATOR.merge(payload, CREDITS)
+    merged["jobs"] = [with_portal_key(record) for record in merged.get("jobs") or []]
+    merged["notes"] = [with_note_key(note) for note in merged.get("notes") or []]
+    merged["portals"] = _portal_catalog()
+    return merged
 
 
 def _payload_from_progress(loading: bool, cached: bool = False) -> dict:
@@ -623,7 +697,6 @@ def _payload_from_progress(loading: bool, cached: bool = False) -> dict:
         "portals": _portal_list(),
         "credits": list(_progress["credits"]),
         "notes": list(_progress["notes"]),
-        "linkedinSearchUrl": _progress["linkedin"],
         "windowDays": WINDOW_DAYS,
         "version": SNAPSHOT_VERSION,
         "loading": loading,
@@ -640,7 +713,7 @@ def _remember(generation: int, connector, batch: list[Job]) -> None:
         if generation != _progress["generation"]:
             return
         for job in batch:
-            record = job_record(job, include_portal=True)
+            record = job_record(job, include_portal=True, portal_key=connector.key)
             link = record.get("link") or ""
             if not link:
                 continue
@@ -658,9 +731,11 @@ def _remember(generation: int, connector, batch: list[Job]) -> None:
             if key in _progress["note_keys"]:
                 continue
             _progress["note_keys"].add(key)
-            _progress["notes"].append({"portal": connector.label, "message": warning})
-        if connector.key == "linkedin":
-            _progress["linkedin"] = getattr(connector, "search_url", "") or ""
+            _progress["notes"].append({
+                "portal": connector.label,
+                "portalKey": connector.key,
+                "message": warning,
+            })
         now = time.monotonic()
         if batch and now - _progress.get("last_write", 0.0) >= 0.6:
             write_jobs_file(_payload_from_progress(loading=not _progress.get("stopped")))
@@ -675,7 +750,10 @@ def _finish_fetch(generation: int, error: str = "") -> None:
         _progress["error"] = error
         _progress["fetchedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         if error:
-            _progress["notes"].append({"portal": "fetch", "message": error})
+            _progress["notes"].append({"portal": "fetch", "portalKey": "", "message": error})
+            event("jobs", "error", error)
+        else:
+            event("jobs", "info", f"company boards done jobs={len(_progress['jobs'])}")
         payload = _payload_from_progress(loading=False)
         write_jobs_file(payload)
 
@@ -686,6 +764,7 @@ def _portal_sources() -> list[type]:
 
 
 def _fetch_worker(country: str, generation: int) -> None:
+    event("jobs", "info", "company boards start")
     try:
         run_sources(
             _portal_sources(),
@@ -712,7 +791,6 @@ def _reset_progress() -> None:
     _progress["notes"] = []
     _progress["note_keys"] = set()
     _progress["credits"] = []
-    _progress["linkedin"] = ""
     _progress["error"] = ""
     _progress["fetchedAt"] = ""
     _progress["last_write"] = 0.0
@@ -729,12 +807,12 @@ def stop_fetches() -> dict:
         _progress["stopped"] = True
         _progress["running"] = False
         _progress["fetchedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        note = {"portal": "fetch", "message": "Stopped. Showing jobs saved so far."}
+        note = {"portal": "fetch", "portalKey": "", "message": "Stopped. Showing jobs saved so far."}
         if note not in _progress["notes"]:
             _progress["notes"].append(note)
         payload = _payload_from_progress(loading=False)
         write_jobs_file(payload)
-    return FEED_COORDINATOR.merge(payload, CREDITS)
+    return _respond(payload)
 
 
 def _start_main_fetch(country: str, refresh_sidecars: bool) -> dict:
@@ -756,7 +834,7 @@ def saved_or_live_jobs(country: str, refresh: bool) -> dict:
     """Return the saved file when it is complete. A new fetch returns jobs as each company comes in."""
     if refresh:
         payload = _start_main_fetch(country, True)
-        return FEED_COORDINATOR.merge(payload, CREDITS)
+        return _respond(payload)
 
     saved = read_jobs_file()
     if held() or FEED_COORDINATOR.suppressed or _progress.get("stopped") or (saved or {}).get("stopped"):
@@ -772,7 +850,7 @@ def saved_or_live_jobs(country: str, refresh: bool) -> dict:
                 payload = saved
             else:
                 payload = _payload_from_progress(loading=False)
-        return FEED_COORDINATOR.merge(payload, CREDITS)
+        return _respond(payload)
 
     with _jobs_lock:
         if _progress["running"]:
@@ -783,17 +861,17 @@ def saved_or_live_jobs(country: str, refresh: bool) -> dict:
             running = False
     if running:
         FEED_COORDINATOR.start_all(False)
-        return FEED_COORDINATOR.merge(payload, CREDITS)
+        return _respond(payload)
 
     if saved is not None and _snapshot_current(saved):
         FEED_COORDINATOR.start_all(False)
         saved["cached"] = True
         saved["loading"] = False
         saved["portals"] = _portal_list()
-        return FEED_COORDINATOR.merge(saved, CREDITS)
+        return _respond(saved)
 
     payload = _start_main_fetch(country, False)
-    return FEED_COORDINATOR.merge(payload, CREDITS)
+    return _respond(payload)
 
 
 class JobsApiHandler(BaseHTTPRequestHandler):
@@ -817,19 +895,7 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             self._send_json(200, stop_fetches())
             return
         if route.path == "/api/portals":
-            self._send_json(200, {"portals": [{"key": cls.key, "label": cls.label} for cls in CONNECTORS]})
-            return
-        if route.path == "/api/linkedin":
-            first = lambda name, fallback="": (params.get(name) or [fallback])[0].strip()  # noqa: E731
-            refresh = first("refresh", "").casefold() in {"1", "true", "yes"}
-            FEED_COORDINATOR.start("linkedin", refresh)
-            self._send_json(200, FEED_COORDINATOR.payload("linkedin"))
-            return
-        if route.path == "/api/unstop":
-            first = lambda name, fallback="": (params.get(name) or [fallback])[0].strip()  # noqa: E731
-            refresh = first("refresh", "").casefold() in {"1", "true", "yes"}
-            FEED_COORDINATOR.start("unstop", refresh)
-            self._send_json(200, FEED_COORDINATOR.payload("unstop"))
+            self._send_json(200, {"portals": _portal_catalog()})
             return
         if route.path != "/api/jobs":
             self._send_json(404, {"error": f"unknown path {route.path}"})
@@ -846,12 +912,13 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": str(exc)})
             return
         except Exception as exc:  # a portal failure should not kill the server
+            event("api", "error", f"GET /api/jobs failed: {exc}")
             self._send_json(502, {"error": str(exc)})
             return
         self._send_json(200, payload)
 
     def log_message(self, fmt: str, *args) -> None:
-        print(f"  {self.address_string()} {fmt % args}")
+        event("api", "info", f"{self.address_string()} {fmt % args}")
 
     def _send_cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -869,13 +936,16 @@ class JobsApiHandler(BaseHTTPRequestHandler):
 
 
 def serve(port: int, country: str) -> None:
+    enable()
     handler = type("JobsApiHandler", (JobsApiHandler,), {"country": country})
     httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    event("api", "info", f"listening on http://127.0.0.1:{port}")
     print(f"fetchJobsForMe API on http://127.0.0.1:{port}")
     print(f"  GET http://127.0.0.1:{port}/api/jobs?source=all&query=engineer")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
+        event("api", "info", "stopped")
         print("\nstopped")
     finally:
         httpd.server_close()

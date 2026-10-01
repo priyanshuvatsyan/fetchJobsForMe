@@ -6,6 +6,7 @@ import JobList from '../../components/JobList/JobList'
 import Pagination, { PAGE_SIZE } from '../../components/Pagination/Pagination'
 import useJobFilters from '../../hooks/useJobFilters'
 import useJobs from '../../hooks/useJobs'
+import { unmatchedReason } from '../../utils/jobs'
 import './JobsPage.css'
 
 const DEFAULT_FILTERS = {
@@ -22,15 +23,20 @@ const JobsPage = () => {
   const [page, setPage] = useState(1)
 
   const { jobs, portals, credits, notes, status, error, reload, stop, loading: fetching } = useJobs()
-  const visibleJobs = useJobFilters(jobs, filters)
+  const visibleJobs = useJobFilters(jobs, filters, portals)
   const pageJobs = visibleJobs.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+  const empty = visibleJobs.length
+    ? null
+    : unmatchedReason(jobs, filters, portals) || {
+        title: 'No jobs matched',
+        message: 'Try a different keyword, portal, or company.',
+      }
 
   useEffect(() => {
     setPage(1)
   }, [filters])
 
   const loading = status === 'loading'
-  const hiddenByDate = jobs.length - visibleJobs.length
 
   return (
     <div className="jobs-page">
@@ -98,12 +104,8 @@ const JobsPage = () => {
         <JobList
           jobs={pageJobs}
           loading={loading && jobs.length === 0}
-          emptyTitle={jobs.length ? 'No jobs in this date range' : 'No jobs matched'}
-          emptyMessage={
-            jobs.length
-              ? `${hiddenByDate} ${hiddenByDate === 1 ? 'job is' : 'jobs are'} older than the selected range.`
-              : 'Try a different keyword, portal, or company.'
-          }
+          emptyTitle={empty?.title || 'No jobs matched'}
+          emptyMessage={empty?.message || 'Try a different keyword, portal, or company.'}
           emptyAction={
             <Button variant="secondary" onClick={() => setFilters(DEFAULT_FILTERS)}>
               Reset filters

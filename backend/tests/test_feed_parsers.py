@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from Server.api import is_tech_role, to_datetime
+from Server.api import is_tech_role, keeps_india_hybrid_or_remote, to_datetime
 from connectors.FourDayWeek import FourDayWeek
 from connectors.Himalayas import Himalayas
 from connectors.Instahyre import Instahyre
@@ -137,6 +137,18 @@ class FeedParserTests(unittest.TestCase):
         self.assertTrue(is_tech_role("Solutions Architect"))
         self.assertFalse(is_tech_role("Non IT Recruiter"))
         self.assertFalse(is_tech_role("Production Engineer"))
+        self.assertTrue(keeps_india_hybrid_or_remote("Bengaluru, India (Hybrid)"))
+        self.assertTrue(keeps_india_hybrid_or_remote("Work From Home"))
+        self.assertTrue(keeps_india_hybrid_or_remote("United States (Remote)"))
+        self.assertTrue(keeps_india_hybrid_or_remote("Bangalore"))
+        self.assertTrue(keeps_india_hybrid_or_remote("Bengaluru"))
+        self.assertTrue(keeps_india_hybrid_or_remote("Mohali"))
+        self.assertTrue(keeps_india_hybrid_or_remote("Pimpri Chinchwad"))
+        self.assertTrue(keeps_india_hybrid_or_remote("Cochin (Hybrid)"))
+        self.assertTrue(keeps_india_hybrid_or_remote("Thane"))
+        self.assertFalse(keeps_india_hybrid_or_remote("Salem, Oregon, United States"))
+        self.assertFalse(keeps_india_hybrid_or_remote("San Francisco, California, United States (Hybrid)"))
+        self.assertFalse(keeps_india_hybrid_or_remote("Austin, TX"))
 
     def test_stop_keeps_jobs_already_saved(self):
         from Server.api import Job
@@ -174,9 +186,25 @@ class FeedParserTests(unittest.TestCase):
                 ["Software Engineer 0", "Software Engineer 1"],
             )
             self.assertEqual(len(get_store("stopdemo").read()), 2)
+            self.assertTrue(all(record.get("portalKey") == "stopdemo" for record in get_store("stopdemo").read()))
         finally:
             arm()
             get_store("stopdemo").path.unlink(missing_ok=True)
+
+    def test_portal_key_matches_every_label(self):
+        from Server.server import CONNECTORS, with_note_key, with_portal_key
+
+        labels = [cls.label.casefold() for cls in CONNECTORS]
+        self.assertEqual(len(labels), len(set(labels)))
+        for cls in CONNECTORS:
+            record = with_portal_key({"portal": cls.label, "role": "Engineer"})
+            self.assertEqual(record["portalKey"], cls.key)
+            note = with_note_key({"portal": cls.label, "message": "slow"})
+            self.assertEqual(note["portalKey"], cls.key)
+        week = with_portal_key({"portal": "4 Day Week"})
+        self.assertEqual(week["portalKey"], "fourdayweek")
+        kept = with_portal_key({"portal": "4 Day Week", "portalKey": "fourdayweek"})
+        self.assertIs(kept, with_portal_key(kept))
 
 
 if __name__ == "__main__":
