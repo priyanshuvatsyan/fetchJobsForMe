@@ -1,0 +1,5 @@
+import WorkspacePage from '../../components/WorkspacePage'
+
+export default function ResumeAnalyzer() {
+  return <WorkspacePage eyebrow="CAREER MATERIALS" title="Resume Analyzer" description="Review your resume for clarity, relevant skills, and alignment with target roles." metrics={[{ label: 'Resumes', value: '0' }, { label: 'Skills detected', value: '—' }, { label: 'Last analysis', value: '—' }, { label: 'Target role', value: 'Not set' }]} sections={[{ title: 'Your resumes', description: 'Upload a resume to get started.', emptyMessage: 'No resume added yet. Your resume will be analyzed locally by the connected service.' }, { title: 'Analysis checklist', items: [{ title: 'Experience clarity', detail: 'Make impact and responsibilities easy to scan' }, { title: 'Skills alignment', detail: 'Compare skills against target job descriptions' }, { title: 'Formatting', detail: 'Check structure and readability' }] }]} />
+}

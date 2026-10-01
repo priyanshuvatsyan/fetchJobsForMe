@@ -18,12 +18,17 @@ function toQueryString(params) {
   return query ? `?${query}` : ''
 }
 
-export async function getJson(path, { params = {}, signal } = {}) {
+async function request(method, path, { params = {}, body, signal } = {}) {
   let response
   try {
     response = await fetch(`${BASE_URL}${path}${toQueryString(params)}`, {
+      method,
       signal,
-      headers: { Accept: 'application/json' },
+      headers: {
+        Accept: 'application/json',
+        ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
     })
   } catch (error) {
     if (error.name === 'AbortError') throw error
@@ -39,5 +44,10 @@ export async function getJson(path, { params = {}, signal } = {}) {
   }
   return payload
 }
+
+export const getJson = (path, options) => request('GET', path, options)
+export const postJson = (path, body, options = {}) => request('POST', path, { ...options, body })
+export const putJson = (path, body, options = {}) => request('PUT', path, { ...options, body })
+export const deleteJson = (path, options) => request('DELETE', path, options)
 
 export { BASE_URL }

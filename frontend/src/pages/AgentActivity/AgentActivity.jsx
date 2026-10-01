@@ -1,0 +1,5 @@
+import WorkspacePage from '../../components/WorkspacePage'
+
+export default function AgentActivity() {
+  return <WorkspacePage eyebrow="AUTOMATION MONITOR" title="Agent Activity" description="Review what your job-search agent is doing and when it last ran." metrics={[{ label: 'Agent status', value: 'Online' }, { label: 'Portals monitored', value: '6' }, { label: 'Last run', value: 'Not run' }, { label: 'Alerts', value: '0' }]} sections={[{ title: 'Activity log', description: 'Searches and updates from your agent.', emptyMessage: 'Activity will appear after your first search run.' }, { title: 'Monitored sources', items: [{ title: 'Company boards', detail: 'Greenhouse, Lever, and Ashby' }, { title: 'Remote boards', detail: 'RemoteOK, Remotive, and Arbeitnow' }, { title: 'Job aggregator', detail: 'Adzuna' }] }]} />
+}

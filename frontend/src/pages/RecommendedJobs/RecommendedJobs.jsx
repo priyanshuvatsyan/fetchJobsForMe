@@ -1,0 +1,5 @@
+import WorkspacePage from '../../components/WorkspacePage'
+
+export default function RecommendedJobs() {
+  return <WorkspacePage eyebrow="MATCHED TO YOU" title="Recommended Jobs" description="Roles ranked against your experience, skills, and preferences." metrics={[{ label: 'Strong matches', value: '0' }, { label: 'Good matches', value: '0' }, { label: 'New this week', value: '0' }, { label: 'Profile match', value: '—' }]} sections={[{ title: 'Top matches', description: 'Personalized recommendations.', emptyMessage: 'Add your target roles and skills to your profile to get relevant recommendations.' }, { title: 'Improve your matches', items: [{ title: 'Add target job titles', detail: 'Tell the agent which roles you want.' }, { title: 'Set location preferences', detail: 'Include cities or remote work.' }, { title: 'Keep skills current', detail: 'Recommendations improve with a complete skills profile.' }] }]} />
+}

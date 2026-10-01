@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { fetchJobs } from '../api/jobs'
+import { fetchJobs, stopJobs } from '../api/jobs'
 
 const EMPTY = {
   jobs: [],
   portals: [],
   credits: [],
   notes: [],
-  linkedinSearchUrl: '',
   loading: false,
   fetchedAt: '',
 }
@@ -32,6 +31,7 @@ export function useJobs() {
     request.current = controller
     setStatus('loading')
     setError(null)
+    if (refresh) setData((current) => ({ ...current, loading: true }))
 
     const pull = (isRefresh) => {
       fetchJobs({ refresh: isRefresh }, controller.signal)
@@ -65,7 +65,38 @@ export function useJobs() {
 
   const reload = useCallback(() => load(true), [load])
 
-  return { ...data, status, error, reload }
+  const stop = useCallback(() => {
+    const gen = generation.current + 1
+    generation.current = gen
+    request.current?.abort()
+    clearTimeout(timer.current)
+    const controller = new AbortController()
+    request.current = controller
+    stopJobs(controller.signal)
+      .then((result) => {
+        if (gen !== generation.current || controller.signal.aborted) return
+        setData(result)
+        setStatus('success')
+        setError(null)
+        timer.current = setTimeout(() => {
+          fetchJobs({ refresh: false }, controller.signal)
+            .then((latest) => {
+              if (gen !== generation.current || controller.signal.aborted) return
+              setData({ ...latest, loading: false })
+            })
+            .catch((cause) => {
+              if (cause?.name === 'AbortError') return
+            })
+        }, 1200)
+      })
+      .catch((cause) => {
+        if (gen !== generation.current || controller.signal.aborted || cause.name === 'AbortError') return
+        setError(cause)
+        setStatus('error')
+      })
+  }, [])
+
+  return { ...data, status, error, reload, stop }
 }
 
 export default useJobs

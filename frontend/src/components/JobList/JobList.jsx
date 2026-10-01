@@ -3,7 +3,16 @@ import JobCardSkeleton from '../JobCard/JobCardSkeleton'
 import EmptyState from '../EmptyState/EmptyState'
 import './JobList.css'
 
-const JobList = ({ jobs, loading, skeletonCount = 4, emptyTitle, emptyMessage, emptyAction }) => {
+const JobList = ({
+  jobs,
+  loading,
+  skeletonCount = 4,
+  emptyTitle,
+  emptyMessage,
+  emptyAction,
+  savedLinks,
+  onToggleSave,
+}) => {
   if (loading) {
     return (
       <div className="job-list" aria-busy="true">
@@ -21,7 +30,12 @@ const JobList = ({ jobs, loading, skeletonCount = 4, emptyTitle, emptyMessage, e
   return (
     <div className="job-list">
       {jobs.map((job) => (
-        <JobCard key={job.id} job={job} />
+        <JobCard
+          key={job.id}
+          job={job}
+          saved={savedLinks ? savedLinks.has(job.link) : false}
+          onToggleSave={onToggleSave}
+        />
       ))}
     </div>
   )

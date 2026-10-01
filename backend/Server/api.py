@@ -17,6 +17,8 @@ from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from Server.control import cancelled, token
+
 USER_AGENT = "fetchJobsForMe/0.1 (personal job search; public APIs only)"
 # RemoteOK's public JSON API redirect-loops unless the client sends a browser User-Agent.
 BROWSER_USER_AGENT = (
@@ -174,6 +176,240 @@ def clean(value) -> str:
     return " ".join(str(value or "").split())
 
 
+# Web fetches keep CSE/IT jobs from this window: India, Indian hybrid, or remote.
+POSTED_WINDOW_DAYS = 15
+
+_INDIA_MARKERS = (
+    "india",
+    "andhra pradesh",
+    "arunachal",
+    "assam",
+    "bihar",
+    "chhattisgarh",
+    "goa",
+    "gujarat",
+    "haryana",
+    "himachal",
+    "jharkhand",
+    "karnataka",
+    "kerala",
+    "madhya pradesh",
+    "maharashtra",
+    "manipur",
+    "meghalaya",
+    "mizoram",
+    "nagaland",
+    "odisha",
+    "punjab",
+    "rajasthan",
+    "sikkim",
+    "tamil nadu",
+    "telangana",
+    "tripura",
+    "uttar pradesh",
+    "uttarakhand",
+    "west bengal",
+    "delhi",
+    "chandigarh",
+    "puducherry",
+    "jammu",
+    "kashmir",
+    "ladakh",
+    "bengaluru",
+    "bangalore",
+    "hyderabad",
+    "mumbai",
+    "pune",
+    "chennai",
+    "noida",
+    "gurgaon",
+    "gurugram",
+    "kolkata",
+    "ahmedabad",
+    "jaipur",
+    "kochi",
+    "thiruvananthapuram",
+    "indore",
+    "lucknow",
+    "nagpur",
+    "coimbatore",
+    "vadodara",
+    "surat",
+    "bhopal",
+    "visakhapatnam",
+    "mysuru",
+    "mysore",
+    "kanpur",
+    "nashik",
+    "faridabad",
+    "ghaziabad",
+    "ncr",
+    "pimpri",
+    "chinchwad",
+    "thane",
+    "navi mumbai",
+    "mohali",
+    "panchkula",
+    "zirakpur",
+    "mangalore",
+    "mangaluru",
+    "trivandrum",
+    "cochin",
+    "calicut",
+    "kozhikode",
+    "ernakulam",
+    "kannur",
+    "kottayam",
+    "palakkad",
+    "kollam",
+    "madurai",
+    "coimbatore",
+    "salem",
+    "tiruppur",
+    "vellore",
+    "erode",
+    "dindigul",
+    "tiruchirappalli",
+    "trichy",
+    "amravati",
+    "raipur",
+    "bhubaneswar",
+    "bhubaneshwar",
+    "kolhapur",
+    "vijayawada",
+    "ludhiana",
+    "solapur",
+    "gandhinagar",
+    "nellore",
+    "panaji",
+    "panjim",
+    "dehradun",
+    "udaipur",
+    "guwahati",
+    "varanasi",
+    "dharwad",
+    "rohtak",
+    "vapi",
+    "vijayapura",
+    "tirupati",
+    "rajkot",
+    "bikaner",
+    "karnal",
+    "kota",
+    "meerut",
+    "jamshedpur",
+    "guntur",
+    "srikakulam",
+    "kadapa",
+    "vasai",
+    "jabalpur",
+    "nagercoil",
+    "siliguri",
+    "jodhpur",
+    "roorkee",
+    "vizianagaram",
+    "vishakhapatnam",
+    "ajmer",
+    "solan",
+    "bareilly",
+    "kurnool",
+    "aligarh",
+    "bhavnagar",
+    "malappuram",
+    "baddi",
+    "patna",
+    "ranchi",
+    "jalandhar",
+    "amritsar",
+    "agra",
+    "prayagraj",
+    "allahabad",
+    "aurangabad",
+    "hubli",
+    "hubballi",
+    "belgaum",
+    "belagavi",
+    "warangal",
+    "pondicherry",
+    "cuttack",
+    "rourkela",
+    "howrah",
+    "durgapur",
+    "gwalior",
+    "ujjain",
+    "haridwar",
+    "shimla",
+    "patiala",
+    "ambala",
+    "panipat",
+    "sonipat",
+    "manesar",
+    "secunderabad",
+    "gachibowli",
+    "madhapur",
+    "kondapur",
+    "hinjewadi",
+    "whitefield",
+    "bombay",
+    "madras",
+    "calcutta",
+    "baroda",
+    "poona",
+)
+# A bare "Salem" on Indian boards is Salem, Tamil Nadu. The same word in a US address is not.
+_AMBIGUOUS_INDIA = {"salem"}
+_FOREIGN_COUNTRY = (
+    "united states",
+    "united kingdom",
+    "u.s.a",
+    "usa",
+    "canada",
+    "australia",
+    "germany",
+    "france",
+    "ireland",
+    "singapore",
+)
+_REMOTE_MARKERS = ("remote", "work from home", "wfh", "anywhere", "worldwide")
+
+
+def _mentions(text: str, marker: str) -> bool:
+    return re.search(rf"(?<![a-z0-9]){re.escape(marker)}(?![a-z0-9])", text) is not None
+
+
+def in_india(location: str) -> bool:
+    """True when the text names India or an Indian city, even without the word India."""
+    text = (location or "").casefold()
+    hits = [marker for marker in _INDIA_MARKERS if _mentions(text, marker)]
+    if not hits:
+        return False
+    if any(marker not in _AMBIGUOUS_INDIA for marker in hits):
+        return True
+    return not any(country in text for country in _FOREIGN_COUNTRY)
+
+
+def keeps_india_hybrid_or_remote(location: str) -> bool:
+    """India (including Indian hybrid) or a remote role anywhere."""
+    text = (location or "").casefold()
+    if not text:
+        return False
+    if any(_mentions(text, marker) for marker in _REMOTE_MARKERS):
+        return True
+    return in_india(text)
+
+
+def visible_record(record: dict, window_days: int = POSTED_WINDOW_DAYS) -> bool:
+    """Saved rows shown on the jobs page: tech, India/hybrid/remote, inside the window."""
+    if not isinstance(record, dict) or not is_tech_role(record.get("role", "")):
+        return False
+    if not keeps_india_hybrid_or_remote(record.get("location") or ""):
+        return False
+    posted = record.get("added on") or ""
+    if posted and window_days and not within_days(posted, window_days):
+        return False
+    return True
+
+
 def within_days(posted_at: str, days: int) -> bool:
     """True when a portal timestamp falls inside the last `days` days."""
     if not posted_at or days <= 0:
@@ -183,6 +419,23 @@ def within_days(posted_at: str, days: int) -> bool:
     except ValueError:
         return False
     return datetime.now(timezone.utc) - moment <= timedelta(days=days)
+
+
+_GMT_OFFSET = re.compile(r"\sGMT([+-])(\d{2}):?(\d{2})?$", re.I)
+_COMPACT_OFFSET = re.compile(r"([+-])(\d{2})(\d{2})$")
+
+
+def _with_iso_offset(text: str) -> str:
+    """Turn 'GMT+0530' and '+0530' into an offset fromisoformat understands."""
+    gmt = _GMT_OFFSET.search(text)
+    if gmt:
+        sign, hours, minutes = gmt.group(1), gmt.group(2), gmt.group(3) or "00"
+        text = f"{text[: gmt.start()]}{sign}{hours}:{minutes}"
+    compact = _COMPACT_OFFSET.search(text)
+    if compact and (compact.start() == 0 or text[compact.start() - 1] != ":"):
+        sign, hours, minutes = compact.group(1), compact.group(2), compact.group(3)
+        text = f"{text[: compact.start()]}{sign}{hours}:{minutes}"
+    return text
 
 
 def to_datetime(value) -> str:
@@ -198,7 +451,7 @@ def to_datetime(value) -> str:
         except (OverflowError, OSError, ValueError):
             return ""
         return moment.strftime("%Y-%m-%d %H:%M:%S")
-    text = str(value).strip()
+    text = _with_iso_offset(str(value).strip())
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     try:
@@ -223,7 +476,51 @@ def company_from_slug(slug: str) -> str:
     return clean(slug).replace("-", " ").replace("_", " ").title()
 
 
+_TECH_ROLE = re.compile(
+    r"\b(?:"
+    r"software|developer|programmer|coder|full[\s-]?stack|front[\s-]?end|back[\s-]?end|"
+    r"web|mobile|android|ios|devops|devsecops|mlops|llmops|dataops|sre|site reliability|"
+    r"cloud|infrastructure|sysadmin|system administrator|systems? engineer|systems? analyst|"
+    r"network|cyber|cybersecurity|infosec|information security|application security|"
+    r"security engineer|security analyst|penetration|pentest|soc analyst|"
+    r"data|analytics|business intelligence|bi|etl|big data|"
+    r"machine learning|ml|ai|artificial intelligence|deep learning|nlp|computer vision|"
+    r"llm|gen\s?ai|generative|prompt engineer|"
+    r"automation|rpa|qa|quality assurance|sdet|tester|testing|test engineer|"
+    r"database|dba|sql|python|java|javascript|typescript|react|angular|node(?:\.?js)?|"
+    r"\.net|golang|rust|php|ruby|scala|kotlin|swift|salesforce|servicenow|sap|erp|"
+    r"blockchain|web3|embedded|firmware|game developer|ui developer|ux engineer|"
+    r"(?:software|solutions?|cloud|data|enterprise|technical|systems?|security|it) architect|"
+    r"tech lead|technical lead|cto|kubernetes|platform|"
+    r"application support|technical support|it support|helpdesk|help desk"
+    r")\b",
+    re.I,
+)
+_IT_WORD = re.compile(r"\bIT\b")
+_ENGINEER = re.compile(r"\bengineer(?:ing)?\b", re.I)
+_NOT_TECH = re.compile(
+    r"\b(?:civil|mechanical|chemical|structural|construction|hvac|plumbing|geotechnical|"
+    r"environmental|petroleum|mining|manufacturing|maintenance|field service|"
+    r"sales engineer|data entry|security guard|security officer|process engineer|"
+    r"electrical engineer|electronics engineer|production engineer|biomedical|"
+    r"agricultural|marine|non[- ]?it|recruiter|business development)\b",
+    re.I,
+)
+
+
+def is_tech_role(title: str) -> bool:
+    """Computer science and IT roles only. Uses the job title."""
+    text = clean(title)
+    if not text or _NOT_TECH.search(text):
+        return False
+    if _TECH_ROLE.search(text) or _IT_WORD.search(text):
+        return True
+    return bool(_ENGINEER.search(text))
+
+
 def job_matches(job: Job, query: str, where: str) -> bool:
+    if not is_tech_role(job.title):
+        return False
     haystack = f"{job.title} {job.company} {job.location}".casefold()
     if query and query.casefold() not in haystack:
         return False
@@ -498,34 +795,38 @@ def load_boards(tokens: list[str], fetch, workers: int = 12, accept=None):
     if not pending_tokens:
         return found, warnings
 
+    started = token()
     stop = False
+
+    def halt() -> bool:
+        return stop or cancelled() or token() != started
     index = 0
     inflight: dict = {}
     worker_count = min(max(1, workers), len(pending_tokens))
 
     def submit_more(pool: ThreadPoolExecutor) -> None:
         nonlocal index
-        while index < len(pending_tokens) and len(inflight) < worker_count and not stop:
-            token = pending_tokens[index]
+        while index < len(pending_tokens) and len(inflight) < worker_count and not halt():
+            board = pending_tokens[index]
             index += 1
-            inflight[pool.submit(fetch, token)] = token
+            inflight[pool.submit(fetch, board)] = board
 
     def take(future) -> None:
         nonlocal stop
-        token = inflight.pop(future)
+        board = inflight.pop(future)
         try:
             payload = future.result()
         except CancelledError:
             return
         except ApiError as exc:
             if not is_missing_board(exc):
-                warnings.append(f"{token}: {exc}")
+                warnings.append(f"{board}: {exc}")
             return
         except (ValueError, OSError) as exc:
-            warnings.append(f"{token}: {exc}")
+            warnings.append(f"{board}: {exc}")
             return
-        found.append((token, payload))
-        if accept is not None and accept(token, payload):
+        found.append((board, payload))
+        if accept is not None and accept(board, payload):
             stop = True
 
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
@@ -534,7 +835,7 @@ def load_boards(tokens: list[str], fetch, workers: int = 12, accept=None):
             done, _pending = wait(inflight, return_when=FIRST_COMPLETED)
             for future in done:
                 take(future)
-            if stop:
+            if halt():
                 for future in inflight:
                     future.cancel()
                 while inflight:
@@ -617,7 +918,10 @@ def fetch_lever_postings(site: str, limit: int = 0, client: ApiClient | None = N
     postings: list = []
     seen: set[str] = set()
     skip = 0
+    started = token()
     while skip < 5000:
+        if cancelled() or token() != started:
+            break
         page = _lever_page(http, site, skip=skip, limit=_LEVER_PAGE)
         fresh = []
         for item in page:
