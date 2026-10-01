@@ -11,8 +11,8 @@ const DATE_OPTIONS = Object.entries(DATE_RANGES).map(([value, range]) => ({
 }))
 
 /**
- * Search and portal changes refetch from the API; date range and sort are
- * applied to the loaded list, so they feel instant.
+ * Filters apply to the jobs already loaded. The portal value is the API key
+ * (for example fourdayweek), matched to each job's portalKey.
  */
 const JobFilterBar = ({ filters, portals, onChange, onReset, busy }) => {
   const set = (key) => (value) => onChange({ ...filters, [key]: value })

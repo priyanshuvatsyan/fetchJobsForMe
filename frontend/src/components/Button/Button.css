@@ -27,6 +27,12 @@
   cursor: progress;
 }
 
+.btn.is-stop {
+  border-color: #b45309;
+  color: #fdba74;
+  cursor: pointer;
+}
+
 .btn-sm {
   padding: 7px 13px;
   font-size: 13px;

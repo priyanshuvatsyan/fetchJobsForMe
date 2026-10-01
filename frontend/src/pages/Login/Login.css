@@ -350,12 +350,24 @@ html, body, #root {
 }
 
 .forgot-password {
+  padding: 0;
+  border: 0;
+  background: transparent;
   font-size: 13px;
   color: var(--accent-primary);
-  text-decoration: none;
+  cursor: pointer;
 }
 
 .forgot-password:hover { text-decoration: underline; }
+
+.auth-feedback {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.auth-feedback.error { color: #f87171; }
+.auth-feedback.success { color: var(--success); }
 
 .input-wrapper {
   position: relative;
@@ -365,9 +377,17 @@ html, body, #root {
 
 .input-icon {
   position: absolute;
+  z-index: 1;
   left: 16px;
   color: var(--text-muted);
   font-size: 18px;
+  pointer-events: none;
+}
+
+.input-icon svg {
+  display: block;
+  width: 18px;
+  height: 18px;
 }
 
 input {
@@ -414,6 +434,13 @@ input:focus + .input-icon { color: var(--accent-primary); }
 .btn-primary:hover {
   transform: translateY(-2px);
   box-shadow: 0 6px 20px rgba(124, 58, 237, 0.4);
+}
+
+.btn-primary:disabled,
+.btn-icon:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  transform: none;
 }
 
 .btn-arrow { transition: transform 0.3s ease; }

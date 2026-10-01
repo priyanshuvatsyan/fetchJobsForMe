@@ -31,12 +31,15 @@ class Remotive:
             body = item.get("description") or ""
             experience, skill = job_profile(title, body, item.get("tags"))
             about_company, job_description = split_description(body)
+            place = clean(item.get("candidate_required_location"))
+            if "remote" not in place.casefold():
+                place = f"{place} (Remote)" if place else "Remote"
             jobs.append(
                 Job(
                     source=self.label,
                     title=title,
                     company=clean(item.get("company_name")),
-                    location=clean(item.get("candidate_required_location")),
+                    location=place,
                     url=clean(item.get("url")),
                     posted_at=to_datetime(item.get("publication_date")),
                     experience=experience,

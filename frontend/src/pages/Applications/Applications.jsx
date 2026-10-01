@@ -1,0 +1,5 @@
+import WorkspacePage from '../../components/WorkspacePage'
+
+export default function Applications() {
+  return <WorkspacePage eyebrow="YOUR PIPELINE" title="Applications" description="Keep every opportunity organized from shortlist through offer." metrics={[{ label: 'Saved', value: '0' }, { label: 'Applied', value: '0' }, { label: 'In progress', value: '0' }, { label: 'Offers', value: '0' }]} sections={[{ title: 'Application tracker', description: 'Your roles and current stages.', emptyMessage: 'No applications yet. Save a job from discovery to start your tracker.' }, { title: 'Pipeline stages', items: [{ title: 'Saved', detail: 'Roles to review and apply for' }, { title: 'Applied', detail: 'Applications submitted' }, { title: 'Interviewing', detail: 'Active interview processes' }, { title: 'Offer', detail: 'Offers received' }] }]} />
+}
