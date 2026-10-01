@@ -191,6 +191,19 @@ class FeedParserTests(unittest.TestCase):
             arm()
             get_store("stopdemo").path.unlink(missing_ok=True)
 
+    def test_flush_keeps_file_of_idle_store(self):
+        import json
+
+        from Server.feeds import get_store
+
+        store = get_store("flushdemo")
+        try:
+            store.path.write_text(json.dumps([{"role": "Kept"}]), encoding="utf-8")
+            store.flush()
+            self.assertEqual(json.loads(store.path.read_text(encoding="utf-8")), [{"role": "Kept"}])
+        finally:
+            store.path.unlink(missing_ok=True)
+
     def test_portal_key_matches_every_label(self):
         from Server.server import CONNECTORS, with_note_key, with_portal_key
 
@@ -205,6 +218,39 @@ class FeedParserTests(unittest.TestCase):
         self.assertEqual(week["portalKey"], "fourdayweek")
         kept = with_portal_key({"portal": "4 Day Week", "portalKey": "fourdayweek"})
         self.assertIs(kept, with_portal_key(kept))
+
+    def test_saved_jobs_round_trip(self):
+        import tempfile
+        from pathlib import Path
+
+        import Server.server as server
+
+        original = server.SAVED_FILE
+        server.SAVED_FILE = Path(tempfile.mkdtemp()) / "saved_jobs.json"
+        try:
+            job = {
+                "portal": "4 Day Week",
+                "company": "JumpCloud",
+                "role": "Escalations Engineer",
+                "location": "Turkey (Remote)",
+                "link": "https://4dayweek.io/job/1",
+                "description": {"about company": "", "job description": "Fix things"},
+                "unexpected": "dropped",
+            }
+            stored = server.save_job(job)
+            self.assertEqual(stored["portalKey"], "fourdayweek")
+            self.assertTrue(stored["saved at"])
+            self.assertNotIn("unexpected", stored)
+            self.assertEqual(server.save_job(job)["saved at"], stored["saved at"])
+            self.assertEqual(len(server.read_saved()), 1)
+            with self.assertRaises(ValueError):
+                server.save_job({"role": "No link"})
+            self.assertTrue(server.unsave_job(job["link"]))
+            self.assertFalse(server.unsave_job(job["link"]))
+            self.assertEqual(server.read_saved(), [])
+        finally:
+            server.SAVED_FILE.unlink(missing_ok=True)
+            server.SAVED_FILE = original
 
 
 if __name__ == "__main__":

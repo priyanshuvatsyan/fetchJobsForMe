@@ -590,22 +590,86 @@ def read_jobs_file() -> dict | None:
     return payload
 
 
-def write_jobs_file(payload: dict) -> None:
-    """OneDrive or an editor can lock the file for a moment. Retry, and never fail a fetch over it."""
-    JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temporary = JOBS_FILE.with_suffix(".json.tmp")
+def _write_json(path: Path, payload) -> None:
+    """OneDrive or an editor can lock the file for a moment. Retry, and never fail a request over it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
     body = json.dumps(payload, ensure_ascii=False)
     for attempt in range(5):
         try:
             temporary.write_text(body, encoding="utf-8")
-            temporary.replace(JOBS_FILE)
+            temporary.replace(path)
             return
         except OSError:
             time.sleep(0.3 * (attempt + 1))
     try:
-        JOBS_FILE.write_text(body, encoding="utf-8")
+        path.write_text(body, encoding="utf-8")
     except OSError as exc:
-        print(f"  could not save {JOBS_FILE.name}: {exc}")
+        event("api", "error", f"could not save {path.name}: {exc}")
+
+
+def write_jobs_file(payload: dict) -> None:
+    _write_json(JOBS_FILE, payload)
+
+
+# Starred jobs. Kept until the user removes them, so they outlive the 15-day feed window.
+SAVED_FILE = JOBS_FILE.parent / "saved_jobs.json"
+_saved_lock = threading.Lock()
+_SAVED_FIELDS = (
+    "portal", "portalKey", "company", "role", "experience",
+    "skill", "salary", "added on", "location", "link",
+)
+
+
+def read_saved() -> list[dict]:
+    try:
+        payload = json.loads(SAVED_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict) and item.get("link")]
+
+
+def _saved_record(record: dict) -> dict:
+    """Keep only the job fields the UI renders. Raises ValueError for a record that cannot be saved."""
+    if not isinstance(record, dict):
+        raise ValueError("job must be an object")
+    link = str(record.get("link") or "").strip()
+    if not link.startswith(("http://", "https://")):
+        raise ValueError("job needs an http(s) link")
+    clean = {field: str(record.get(field) or "") for field in _SAVED_FIELDS}
+    clean["link"] = link
+    description = record.get("description") if isinstance(record.get("description"), dict) else {}
+    clean["description"] = {
+        "about company": str(description.get("about company") or ""),
+        "job description": str(description.get("job description") or ""),
+    }
+    return with_portal_key(clean)
+
+
+def save_job(record: dict) -> dict:
+    job = _saved_record(record)
+    with _saved_lock:
+        saved = read_saved()
+        existing = next((item for item in saved if item["link"] == job["link"]), None)
+        if existing is not None:
+            return existing
+        job["saved at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        _write_json(SAVED_FILE, [job, *saved])
+    event(job.get("portalKey") or "saved", "info", f"saved {job['role']} — {job['company']}")
+    return job
+
+
+def unsave_job(link: str) -> bool:
+    with _saved_lock:
+        saved = read_saved()
+        remaining = [item for item in saved if item["link"] != link]
+        if len(remaining) == len(saved):
+            return False
+        _write_json(SAVED_FILE, remaining)
+    event("saved", "info", f"removed {link}")
+    return True
 
 
 SNAPSHOT_VERSION = 3
@@ -874,8 +938,49 @@ def saved_or_live_jobs(country: str, refresh: bool) -> dict:
     return _respond(payload)
 
 
+def _current_view() -> dict:
+    """Jobs the page would show right now. Unlike /api/jobs this never starts a fetch."""
+    with _jobs_lock:
+        live = _progress["running"] or bool(_progress["jobs"])
+        payload = _payload_from_progress(loading=_progress["running"]) if live else None
+    if payload is None:
+        payload = read_jobs_file() or _payload_from_progress(loading=False)
+    return _respond(payload)
+
+
+def jobs_summary() -> dict:
+    """Numbers for Job Discovery: portals with jobs, jobs posted in 24 hours, saved jobs, last fetch."""
+    view = _current_view()
+    counts: dict[str, int] = {}
+    new_today = 0
+    for record in view.get("jobs") or []:
+        key = record.get("portalKey") or ""
+        if key:
+            counts[key] = counts.get(key, 0) + 1
+        posted = record.get("added on") or ""
+        if posted and within_days(posted, 1):
+            new_today += 1
+    sources = [
+        {"key": portal["key"], "label": portal["label"], "status": portal["status"], "count": counts[portal["key"]]}
+        for portal in view.get("portals") or []
+        if counts.get(portal["key"])
+    ]
+    sources.sort(key=lambda source: source["count"], reverse=True)
+    return {
+        "sourcesConnected": len(sources),
+        "sources": sources,
+        "total": len(view.get("jobs") or []),
+        "newToday": new_today,
+        "saved": len(read_saved()),
+        "loading": bool(view.get("loading")),
+        "fetchedAt": view.get("fetchedAt") or "",
+    }
+
+
 class JobsApiHandler(BaseHTTPRequestHandler):
-    """Read-only JSON API for the web app."""
+    """JSON API for the web app. Jobs are read-only; saved jobs accept POST and DELETE."""
+
+    max_body = 1_000_000
 
     server_version = "fetchJobsForMe"
     country = "in"
@@ -897,6 +1002,13 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         if route.path == "/api/portals":
             self._send_json(200, {"portals": _portal_catalog()})
             return
+        if route.path == "/api/saved":
+            saved = read_saved()
+            self._send_json(200, {"jobs": saved, "count": len(saved)})
+            return
+        if route.path == "/api/summary":
+            self._send_json(200, jobs_summary())
+            return
         if route.path != "/api/jobs":
             self._send_json(404, {"error": f"unknown path {route.path}"})
             return
@@ -917,13 +1029,54 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             return
         self._send_json(200, payload)
 
+    def do_POST(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+        if urlparse(self.path).path != "/api/saved":
+            self._send_json(404, {"error": f"unknown path {urlparse(self.path).path}"})
+            return
+        body = self._read_json()
+        if body is None:
+            return
+        try:
+            job = save_job(body.get("job") if isinstance(body, dict) else None)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        self._send_json(201, {"job": job, "count": len(read_saved())})
+
+    def do_DELETE(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+        route = urlparse(self.path)
+        if route.path != "/api/saved":
+            self._send_json(404, {"error": f"unknown path {route.path}"})
+            return
+        link = (parse_qs(route.query).get("link") or [""])[0].strip()
+        if not link:
+            self._send_json(400, {"error": "link is required"})
+            return
+        removed = unsave_job(link)
+        self._send_json(200 if removed else 404, {"removed": removed, "count": len(read_saved())})
+
+    def _read_json(self):
+        """Parse a JSON request body, or send 400/413 and return None."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > self.max_body:
+            self._send_json(413, {"error": "request body too large"})
+            return None
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json(400, {"error": "body must be JSON"})
+            return None
+
     def log_message(self, fmt: str, *args) -> None:
         event("api", "info", f"{self.address_string()} {fmt % args}")
 
     def _send_cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 
     def _send_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")

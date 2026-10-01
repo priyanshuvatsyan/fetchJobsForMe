@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import Button from '../../components/Button/Button'
 import Callout from '../../components/Callout/Callout'
 import JobFilterBar from '../../components/JobFilterBar/JobFilterBar'
@@ -6,6 +6,7 @@ import JobList from '../../components/JobList/JobList'
 import Pagination, { PAGE_SIZE } from '../../components/Pagination/Pagination'
 import useJobFilters from '../../hooks/useJobFilters'
 import useJobs from '../../hooks/useJobs'
+import useSavedJobs from '../../hooks/useSavedJobs'
 import { unmatchedReason } from '../../utils/jobs'
 import './JobsPage.css'
 
@@ -19,10 +20,15 @@ const DEFAULT_FILTERS = {
 }
 
 const JobsPage = () => {
-  const [filters, setFilters] = useState(DEFAULT_FILTERS)
+  const [filters, setFiltersState] = useState(DEFAULT_FILTERS)
   const [page, setPage] = useState(1)
+  const setFilters = (next) => {
+    setFiltersState(next)
+    setPage(1)
+  }
 
   const { jobs, portals, credits, notes, status, error, reload, stop, loading: fetching } = useJobs()
+  const { savedLinks, toggle: toggleSaved, error: saveError } = useSavedJobs()
   const visibleJobs = useJobFilters(jobs, filters, portals)
   const pageJobs = visibleJobs.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
   const empty = visibleJobs.length
@@ -32,14 +38,10 @@ const JobsPage = () => {
         message: 'Try a different keyword, portal, or company.',
       }
 
-  useEffect(() => {
-    setPage(1)
-  }, [filters])
-
   const loading = status === 'loading'
 
   return (
-    <div className="jobs-page">
+    <div className="jobs-page job-theme">
       <div className="jobs-page-inner">
         <header className="jobs-page-header">
           <div>
@@ -89,6 +91,12 @@ const JobsPage = () => {
           </Callout>
         ) : null}
 
+        {saveError ? (
+          <Callout tone="error" title="Could not update saved jobs">
+            <p>{saveError.message}</p>
+          </Callout>
+        ) : null}
+
         {notes.length ? (
           <Callout tone="warning" title={`${notes.length} portal ${notes.length === 1 ? 'note' : 'notes'}`}>
             <ul>
@@ -104,6 +112,8 @@ const JobsPage = () => {
         <JobList
           jobs={pageJobs}
           loading={loading && jobs.length === 0}
+          savedLinks={savedLinks}
+          onToggleSave={toggleSaved}
           emptyTitle={empty?.title || 'No jobs matched'}
           emptyMessage={empty?.message || 'Try a different keyword, portal, or company.'}
           emptyAction={

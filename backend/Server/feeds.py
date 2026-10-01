@@ -69,7 +69,10 @@ class SidecarStore:
                 self._last_write = now
 
     def flush(self) -> None:
+        """Write the in-memory list. A store that never started a fetch owns nothing, so the file is left alone."""
         with self._lock:
+            if self.epoch == 0:
+                return
             self._write()
             self._last_write = time.monotonic()
 

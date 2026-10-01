@@ -38,10 +38,31 @@ export function normalizeJob(record, index = 0) {
       .filter(Boolean),
     salary: record.salary || '',
     postedAt: record['added on'] || '',
+    savedAt: record['saved at'] || '',
     location: record.location || '',
     aboutCompany: description['about company'] || '',
     jobDescription: description['job description'] || '',
     link: record.link || '',
+  }
+}
+
+/** Inverse of normalizeJob: the record shape the API stores. */
+export function toRecord(job) {
+  return {
+    portal: job.portal,
+    portalKey: job.portalKey,
+    company: job.company,
+    role: job.role,
+    experience: job.experience,
+    skill: job.skills.join(', '),
+    salary: job.salary,
+    'added on': job.postedAt,
+    location: job.location,
+    description: {
+      'about company': job.aboutCompany,
+      'job description': job.jobDescription,
+    },
+    link: job.link,
   }
 }
 
