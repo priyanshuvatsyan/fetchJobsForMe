@@ -21,7 +21,7 @@ import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -62,7 +62,7 @@ def event(portal: str, level: str, message: str) -> None:
     _LOGGER.log(numeric, "[%s] %s", portal or "-", message)
 
 
-from Server.api import POSTED_WINDOW_DAYS, Job, is_tech_role, keeps_india_hybrid_or_remote, within_days
+from Server.api import POSTED_WINDOW_DAYS, Job, clean, is_tech_role, keeps_india_hybrid_or_remote, within_days
 from Server.control import arm, cancel, held
 from Server.feeds import FeedCoordinator
 from connectors.Adzuna import Adzuna
@@ -78,6 +78,7 @@ from connectors.FourDayWeek import FourDayWeek
 from connectors.Himalayas import Himalayas
 from connectors.Instahyre import Instahyre
 from connectors.Jobicy import Jobicy
+from connectors.Naukri import Naukri
 from connectors.Shine import Shine
 from connectors.TheMuse import TheMuse
 from connectors.WeWorkRemotely import WeWorkRemotely
@@ -97,6 +98,7 @@ CONNECTORS = [
     LinkedIn,
     Unstop,
     Shine,
+    Naukri,
     Instahyre,
     Himalayas,
     Jobicy,
@@ -136,6 +138,7 @@ CREDITS = {
     "themuse": "Jobs sourced from The Muse — https://www.themuse.com",
     "fourdayweek": "Jobs sourced from 4 Day Week — https://4dayweek.io",
     "weworkremotely": "Jobs sourced from We Work Remotely — https://weworkremotely.com",
+    "naukri": "Jobs sourced from Naukri — https://www.naukri.com",
 }
 SIDECAR_SOURCES = [cls for cls in CONNECTORS if getattr(cls, "persist", "") == "sidecar"]
 FEED_COORDINATOR = FeedCoordinator(SIDECAR_SOURCES, WINDOW_DAYS, paused=PAUSED_SIDECAR_KEYS)
@@ -466,6 +469,8 @@ def job_record(job: Job, include_portal: bool, portal_key: str = "") -> dict:
         "description": {
             "about company": job.about_company,
             "job description": job.job_description,
+            **({"openings": job.openings} if job.openings else {}),
+            **({"applicants": job.applicants} if job.applicants else {}),
         },
         "link": job.url,
     }
@@ -650,6 +655,10 @@ def _saved_record(record: dict) -> dict:
         "about company": str(description.get("about company") or ""),
         "job description": str(description.get("job description") or ""),
     }
+    for field in ("openings", "applicants"):
+        value = str(description.get(field) or "").strip()
+        if value:
+            clean["description"][field] = value
     return with_portal_key(clean)
 
 
@@ -675,6 +684,151 @@ def unsave_job(link: str) -> bool:
         _write_json(SAVED_FILE, remaining)
     event("saved", "info", f"removed {link}")
     return True
+
+
+# Per-user job-search preferences. The Firebase uid is used only as a stable
+# local storage key; no email or other identity data is stored here.
+PREFERENCES_DIR = JOBS_FILE.parent / "preferences"
+_preferences_lock = threading.Lock()
+_POSTED_DAYS = {"today": 1, "yesterday": 2, "7days": 7, "15days": 15}
+_EXP_TEXT = (
+    (re.compile(r"\b(?:intern|internship|fresher|freshers|graduate|entry[- ]level|trainee)\b", re.I), 0),
+    (re.compile(r"\bjunior\b", re.I), 1),
+    (re.compile(r"\b(?:mid[- ]level|intermediate)\b", re.I), 2),
+    (re.compile(r"\bsenior\b", re.I), 3),
+    (re.compile(r"\b(?:lead|staff|principal|architect|manager)\b", re.I), 5),
+)
+
+
+def _preference_file(uid: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", str(uid or ""))[:128]
+    if not safe:
+        raise ValueError("user id is required")
+    return PREFERENCES_DIR / f"{safe}.json"
+
+
+def _empty_preferences() -> dict:
+    return {"experience": None, "posted": "all", "roles": [], "updatedAt": ""}
+
+
+def _experience_setting(value):
+    """Select / blank means every experience level. Otherwise the ceiling is 0–5."""
+    from Server.feeds import experience_cap
+
+    if value is None or str(value).strip().casefold() in {"", "all", "select"}:
+        return None
+    cap = experience_cap(value)
+    if cap is None:
+        raise ValueError("experience must be Select or a number from 0 to 5")
+    return cap
+
+
+def _posted_setting(value: str) -> str:
+    posted = str(value or "all").strip().casefold()
+    if posted in {"", "select", "all"}:
+        return "all"
+    if posted not in _POSTED_DAYS:
+        raise ValueError("posted must be Select, today, yesterday, 7days, or 15days")
+    return posted
+
+
+def read_preferences(uid: str) -> dict:
+    result = _empty_preferences()
+    try:
+        payload = json.loads(_preference_file(uid).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return result
+    if not isinstance(payload, dict):
+        return result
+    try:
+        result["experience"] = _experience_setting(payload.get("experience"))
+    except ValueError:
+        result["experience"] = None
+    try:
+        result["posted"] = _posted_setting(payload.get("posted"))
+    except ValueError:
+        result["posted"] = "all"
+    roles = payload.get("roles")
+    if isinstance(roles, list):
+        result["roles"] = list(dict.fromkeys(
+            clean(str(role))[:80] for role in roles if clean(str(role))
+        ))[:20]
+    result["updatedAt"] = str(payload.get("updatedAt") or "")
+    return result
+
+
+def update_preferences(uid: str, changes: dict) -> dict:
+    if not isinstance(changes, dict):
+        raise ValueError("preferences must be an object")
+    experience = _experience_setting(changes.get("experience"))
+    posted = _posted_setting(changes.get("posted"))
+    roles = changes.get("roles")
+    if not isinstance(roles, list):
+        raise ValueError("roles must be a list")
+    preferences = {
+        "experience": experience,
+        "posted": posted,
+        "roles": list(dict.fromkeys(
+            clean(str(role))[:80] for role in roles if clean(str(role))
+        ))[:20],
+        "updatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with _preferences_lock:
+        _write_json(_preference_file(uid), preferences)
+    event("preferences", "info", f"updated uid={uid[:8]} roles={len(preferences['roles'])}")
+    return preferences
+
+
+def preference_days(preferences: dict) -> int:
+    """Select uses the normal 15-day window. The other choices narrow that window."""
+    return _POSTED_DAYS.get(str(preferences.get("posted") or ""), WINDOW_DAYS)
+
+
+def _feed_preferences(preferences: dict) -> dict:
+    from Server.feeds import experience_cap
+
+    return {
+        "windowDays": preference_days(preferences),
+        "experience": experience_cap(preferences.get("experience")),
+        "roles": preferences.get("roles") or [],
+    }
+
+
+def _minimum_experience(record: dict) -> int | None:
+    text = clean(f"{record.get('experience') or ''} {record.get('role') or ''}")
+    experience = clean(record.get("experience"))
+    numbers = [int(value) for value in re.findall(r"\d{1,2}", experience)]
+    if numbers:
+        return min(numbers)
+    for pattern, years in _EXP_TEXT:
+        if pattern.search(text):
+            return years
+    return None
+
+
+def _matches_preferences(record: dict, preferences: dict) -> bool:
+    posted = str(record.get("added on") or "")
+    days = preference_days(preferences)
+    if posted and not within_days(posted, days):
+        return False
+    from Server.feeds import experience_cap, role_matches
+
+    minimum = _minimum_experience(record)
+    cap = experience_cap(preferences.get("experience"))
+    if cap is not None and minimum is not None and minimum > cap:
+        return False
+    return role_matches(record.get("role") or "", record.get("skill") or "", preferences.get("roles") or [])
+
+
+def apply_preferences(payload: dict, preferences: dict) -> dict:
+    result = dict(payload)
+    result["jobs"] = [
+        record for record in payload.get("jobs") or []
+        if _matches_preferences(record, preferences)
+    ]
+    result["count"] = len(result["jobs"])
+    result["preferences"] = preferences
+    return result
 
 
 # Candidate profile and resume. The profile is deliberately provider-neutral so
@@ -1055,13 +1209,15 @@ def _payload_from_progress(loading: bool, cached: bool = False) -> dict:
     }
 
 
-def _remember(generation: int, connector, batch: list[Job]) -> None:
+def _remember(generation: int, connector, batch: list[Job], preferences: dict | None = None) -> None:
     """Add a portal's latest jobs. Same link replaces the earlier card (Greenhouse fills the description in a second pass)."""
     with _jobs_lock:
         if generation != _progress["generation"]:
             return
         for job in batch:
             record = job_record(job, include_portal=True, portal_key=connector.key)
+            if preferences and not _matches_preferences(record, preferences):
+                continue
             link = record.get("link") or ""
             if not link:
                 continue
@@ -1111,7 +1267,7 @@ def _portal_sources() -> list[type]:
     return [cls for cls in CONNECTORS if getattr(cls, "persist", "") != "sidecar"]
 
 
-def _fetch_worker(country: str, generation: int) -> None:
+def _fetch_worker(country: str, generation: int, preferences: dict) -> None:
     event("jobs", "info", "company boards start")
     try:
         run_sources(
@@ -1122,8 +1278,8 @@ def _fetch_worker(country: str, generation: int) -> None:
             boards=None,
             country=country,
             open_browser=False,
-            posted_within_days=WINDOW_DAYS,
-            publish=lambda connector, batch: _remember(generation, connector, batch),
+            posted_within_days=preference_days(preferences),
+            publish=lambda connector, batch: _remember(generation, connector, batch, preferences),
         )
     except Exception as exc:
         _finish_fetch(generation, error=str(exc))
@@ -1163,25 +1319,25 @@ def stop_fetches() -> dict:
     return _respond(payload)
 
 
-def _start_main_fetch(country: str, refresh_sidecars: bool) -> dict:
+def _start_main_fetch(country: str, refresh_sidecars: bool, preferences: dict) -> dict:
     with _jobs_lock:
         _reset_progress()
         generation = _progress["generation"]
         payload = _payload_from_progress(loading=True)
-    FEED_COORDINATOR.start_all(refresh_sidecars)
+    FEED_COORDINATOR.start_all(refresh_sidecars, _feed_preferences(preferences))
     threading.Thread(
         target=_fetch_worker,
-        args=(country, generation),
+        args=(country, generation, preferences),
         name="jobs-fetch",
         daemon=True,
     ).start()
     return payload
 
 
-def saved_or_live_jobs(country: str, refresh: bool) -> dict:
+def saved_or_live_jobs(country: str, refresh: bool, preferences: dict) -> dict:
     """Return the saved file when it is complete. A new fetch returns jobs as each company comes in."""
     if refresh:
-        payload = _start_main_fetch(country, True)
+        payload = _start_main_fetch(country, True, preferences)
         return _respond(payload)
 
     saved = read_jobs_file()
@@ -1208,17 +1364,17 @@ def saved_or_live_jobs(country: str, refresh: bool) -> dict:
             payload = None
             running = False
     if running:
-        FEED_COORDINATOR.start_all(False)
+        FEED_COORDINATOR.start_all(False, _feed_preferences(preferences))
         return _respond(payload)
 
     if saved is not None and _snapshot_current(saved):
-        FEED_COORDINATOR.start_all(False)
+        FEED_COORDINATOR.start_all(False, _feed_preferences(preferences))
         saved["cached"] = True
         saved["loading"] = False
         saved["portals"] = _portal_list()
         return _respond(saved)
 
-    payload = _start_main_fetch(country, False)
+    payload = _start_main_fetch(country, False, preferences)
     return _respond(payload)
 
 
@@ -1296,17 +1452,28 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         if route.path == "/api/profile":
             self._send_json(200, {"profile": read_profile()})
             return
+        if route.path == "/api/preferences":
+            uid = (params.get("uid") or [""])[0].strip()
+            if not uid:
+                self._send_json(400, {"error": "uid is required"})
+                return
+            self._send_json(200, {"preferences": read_preferences(uid)})
+            return
         if route.path != "/api/jobs":
             self._send_json(404, {"error": f"unknown path {route.path}"})
             return
 
         first = lambda name, fallback="": (params.get(name) or [fallback])[0].strip()  # noqa: E731
         refresh = first("refresh", "").casefold() in {"1", "true", "yes"}
+        uid = first("uid")
+        preferences = read_preferences(uid) if uid else _empty_preferences()
         try:
             payload = saved_or_live_jobs(
                 country=first("country", self.country) or self.country,
                 refresh=refresh,
+                preferences=preferences,
             )
+            payload = apply_preferences(payload, preferences)
         except SystemExit as exc:
             self._send_json(400, {"error": str(exc)})
             return
@@ -1343,12 +1510,25 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         self._send_json(201, {"job": job, "count": len(read_saved())})
 
     def do_PUT(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
-        path = urlparse(self.path).path
-        if path != "/api/profile":
+        route = urlparse(self.path)
+        path = route.path
+        if path not in {"/api/profile", "/api/preferences"}:
             self._send_json(404, {"error": f"unknown path {path}"})
             return
         body = self._read_json()
         if body is None:
+            return
+        if path == "/api/preferences":
+            uid = (parse_qs(route.query).get("uid") or [""])[0].strip()
+            try:
+                preferences = update_preferences(
+                    uid,
+                    body.get("preferences") if isinstance(body, dict) else None,
+                )
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            self._send_json(200, {"preferences": preferences})
             return
         try:
             profile = update_profile(body.get("profile") if isinstance(body, dict) else None)
