@@ -1,6 +1,6 @@
 import './WorkspacePage.css'
 
-export default function WorkspacePage({ eyebrow, title, description, metrics, sections }) {
+export default function WorkspacePage({ eyebrow, title, description, metrics, sections, split = false }) {
   return (
     <div className="workspace-page">
       <header className="page-heading">
@@ -24,9 +24,9 @@ export default function WorkspacePage({ eyebrow, title, description, metrics, se
         </section>
       )}
 
-      <div className="page-sections">
+      <div className={`page-sections${split ? ' is-split' : ''}`}>
         {sections.map((section) => (
-          <section className="page-section" key={section.title}>
+          <section className={`page-section${section.wide ? ' is-wide' : ''}`} key={section.title}>
             <div className="section-heading">
               <div>
                 <h2>{section.title}</h2>
@@ -34,7 +34,9 @@ export default function WorkspacePage({ eyebrow, title, description, metrics, se
               </div>
               {section.count && <span>{section.count}</span>}
             </div>
-            {section.items?.length ? (
+            {section.content ? (
+              <div className="section-content">{section.content}</div>
+            ) : section.items?.length ? (
               <ul className="section-list">
                 {section.items.map((item) => (
                   <li key={item.title}>

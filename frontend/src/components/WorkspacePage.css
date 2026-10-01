@@ -30,7 +30,10 @@
 .page-metric small { color: #49c79a; font-size: 10px; }
 
 .page-sections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px; }
+.page-sections.is-split { grid-template-columns: minmax(0, 7fr) minmax(0, 3fr); align-items: start; }
 .page-section { min-width: 0; }
+.page-section.is-wide { grid-column: 1 / -1; }
+.section-content { padding-top: 16px; }
 .section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding-bottom: 14px; border-bottom: 1px solid #202632; }
 .section-heading h2 { margin: 0; color: #e5e9f1; font-size: 14px; font-weight: 600; }
 .section-heading p { margin: 6px 0 0; color: #7f8a9d; font-size: 11px; }
@@ -74,5 +77,6 @@
   .page-heading { align-items: flex-start; }
   .page-heading h1 { font-size: 23px; }
   .page-date { display: none; }
-  .page-sections { grid-template-columns: 1fr; gap: 25px; }
+  .page-sections,
+  .page-sections.is-split { grid-template-columns: 1fr; gap: 25px; }
 }

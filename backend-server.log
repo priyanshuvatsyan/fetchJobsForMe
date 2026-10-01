@@ -1,0 +1,26 @@
+2026-10-01 13:06:59 INFO [api] listening on http://127.0.0.1:8001
+fetchJobsForMe API on http://127.0.0.1:8001
+  GET http://127.0.0.1:8001/api/jobs?source=all&query=engineer
+2026-10-01 13:07:00 INFO [api] 127.0.0.1 "GET /api/health HTTP/1.1" 200 -
+2026-10-01 13:07:58 INFO [api] 127.0.0.1 "GET /api/profile HTTP/1.1" 200 -
+2026-10-01 13:09:42 INFO [api] 127.0.0.1 "GET /api/profile HTTP/1.1" 200 -
+2026-10-01 13:09:57 INFO [api] 127.0.0.1 "GET /api/profile HTTP/1.1" 200 -
+2026-10-01 13:10:21 INFO [api] 127.0.0.1 "OPTIONS /api/profile HTTP/1.1" 204 -
+2026-10-01 13:10:21 INFO [profile] profile updated
+2026-10-01 13:10:21 INFO [api] 127.0.0.1 "PUT /api/profile HTTP/1.1" 200 -
+2026-10-01 13:10:46 INFO [api] 127.0.0.1 "GET /api/profile HTTP/1.1" 200 -
+2026-10-01 13:11:12 INFO [api] 127.0.0.1 "GET /api/saved HTTP/1.1" 200 -
+2026-10-01 13:11:13 INFO [api] 127.0.0.1 "GET /api/saved HTTP/1.1" 200 -
+2026-10-01 13:11:16 INFO [api] 127.0.0.1 "GET /api/profile HTTP/1.1" 200 -
+2026-10-01 13:11:17 INFO [api] 127.0.0.1 "GET /api/summary HTTP/1.1" 200 -
+2026-10-01 13:11:18 INFO [api] 127.0.0.1 "GET /api/jobs HTTP/1.1" 200 -
+2026-10-01 13:19:46 INFO [api] 127.0.0.1 "GET /api/profile HTTP/1.1" 200 -
+2026-10-01 13:21:09 INFO [api] 127.0.0.1 "GET /api/saved HTTP/1.1" 200 -
+2026-10-01 13:21:12 INFO [api] 127.0.0.1 "GET /api/saved HTTP/1.1" 200 -
+2026-10-01 13:21:15 INFO [api] 127.0.0.1 "GET /api/jobs HTTP/1.1" 200 -
+2026-10-01 13:21:17 INFO [api] 127.0.0.1 "GET /api/summary HTTP/1.1" 200 -
+2026-10-01 13:21:32 INFO [api] 127.0.0.1 "GET /api/profile HTTP/1.1" 200 -
+2026-10-01 13:21:32 INFO [api] 127.0.0.1 "GET /api/profile HTTP/1.1" 200 -
+2026-10-01 13:21:47 INFO [api] 127.0.0.1 "OPTIONS /api/profile HTTP/1.1" 204 -
+2026-10-01 13:21:47 INFO [profile] profile updated
+2026-10-01 13:21:47 INFO [api] 127.0.0.1 "PUT /api/profile HTTP/1.1" 200 -

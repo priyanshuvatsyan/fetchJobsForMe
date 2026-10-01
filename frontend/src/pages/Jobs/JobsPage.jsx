@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import Button from '../../components/Button/Button'
 import Callout from '../../components/Callout/Callout'
 import JobFilterBar from '../../components/JobFilterBar/JobFilterBar'
@@ -6,6 +6,8 @@ import JobList from '../../components/JobList/JobList'
 import Pagination, { PAGE_SIZE } from '../../components/Pagination/Pagination'
 import useJobFilters from '../../hooks/useJobFilters'
 import useJobs from '../../hooks/useJobs'
+import useSavedJobs from '../../hooks/useSavedJobs'
+import { unmatchedReason } from '../../utils/jobs'
 import './JobsPage.css'
 
 const DEFAULT_FILTERS = {
@@ -18,22 +20,28 @@ const DEFAULT_FILTERS = {
 }
 
 const JobsPage = () => {
-  const [filters, setFilters] = useState(DEFAULT_FILTERS)
+  const [filters, setFiltersState] = useState(DEFAULT_FILTERS)
   const [page, setPage] = useState(1)
-
-  const { jobs, portals, credits, notes, status, error, reload } = useJobs()
-  const visibleJobs = useJobFilters(jobs, filters)
-  const pageJobs = visibleJobs.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
-
-  useEffect(() => {
+  const setFilters = (next) => {
+    setFiltersState(next)
     setPage(1)
-  }, [filters])
+  }
+
+  const { jobs, portals, credits, notes, status, error, reload, stop, loading: fetching } = useJobs()
+  const { savedLinks, toggle: toggleSaved, error: saveError } = useSavedJobs()
+  const visibleJobs = useJobFilters(jobs, filters, portals)
+  const pageJobs = visibleJobs.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+  const empty = visibleJobs.length
+    ? null
+    : unmatchedReason(jobs, filters, portals) || {
+        title: 'No jobs matched',
+        message: 'Try a different keyword, portal, or company.',
+      }
 
   const loading = status === 'loading'
-  const hiddenByDate = jobs.length - visibleJobs.length
 
   return (
-    <div className="jobs-page">
+    <div className="jobs-page job-theme">
       <div className="jobs-page-inner">
         <header className="jobs-page-header">
           <div>
@@ -52,11 +60,11 @@ const JobsPage = () => {
             ) : null}
             <Button
               variant="secondary"
-              className={loading ? 'is-busy' : ''}
-              onClick={reload}
-              disabled={loading}
+              className={fetching ? 'is-stop' : ''}
+              onClick={fetching ? stop : reload}
+              disabled={!fetching && loading}
             >
-              {loading ? 'Loading...' : 'Refresh'}
+              {fetching ? 'Stop' : 'Refresh'}
             </Button>
           </div>
         </header>
@@ -83,6 +91,12 @@ const JobsPage = () => {
           </Callout>
         ) : null}
 
+        {saveError ? (
+          <Callout tone="error" title="Could not update saved jobs">
+            <p>{saveError.message}</p>
+          </Callout>
+        ) : null}
+
         {notes.length ? (
           <Callout tone="warning" title={`${notes.length} portal ${notes.length === 1 ? 'note' : 'notes'}`}>
             <ul>
@@ -98,12 +112,10 @@ const JobsPage = () => {
         <JobList
           jobs={pageJobs}
           loading={loading && jobs.length === 0}
-          emptyTitle={jobs.length ? 'No jobs in this date range' : 'No jobs matched'}
-          emptyMessage={
-            jobs.length
-              ? `${hiddenByDate} ${hiddenByDate === 1 ? 'job is' : 'jobs are'} older than the selected range.`
-              : 'Try a different keyword, portal, or company.'
-          }
+          savedLinks={savedLinks}
+          onToggleSave={toggleSaved}
+          emptyTitle={empty?.title || 'No jobs matched'}
+          emptyMessage={empty?.message || 'Try a different keyword, portal, or company.'}
           emptyAction={
             <Button variant="secondary" onClick={() => setFilters(DEFAULT_FILTERS)}>
               Reset filters

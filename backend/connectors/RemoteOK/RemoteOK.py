@@ -32,12 +32,15 @@ class RemoteOK:
             body = item.get("description") or ""
             experience, skill = job_profile(title, body, item.get("tags"))
             about_company, job_description = split_description(body)
+            place = clean(item.get("location")) or "Remote"
+            if "remote" not in place.casefold():
+                place = f"{place} (Remote)"
             jobs.append(
                 Job(
                     source=self.label,
                     title=title,
                     company=clean(item.get("company")),
-                    location=clean(item.get("location")) or "Remote",
+                    location=place,
                     url=clean(item.get("url") or item.get("apply_url")),
                     posted_at=to_datetime(item.get("epoch") or item.get("date")),
                     experience=experience,
