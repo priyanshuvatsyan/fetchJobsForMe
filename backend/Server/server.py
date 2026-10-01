@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import threading
@@ -110,7 +111,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="start the jobs API (this is also what happens when no search flags are given)",
     )
-    parser.add_argument("--port", type=int, default=8001, help="port for the jobs API")
+    parser.add_argument(
+        "--host",
+        default=os.getenv("HOST", "0.0.0.0"),
+        help="interface for the jobs API",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("PORT", "8001")),
+        help="port for the jobs API",
+    )
     return parser
 
 
@@ -423,7 +434,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--limit must be at least 1")
 
     if args.serve or not wants_terminal_output(given):
-        serve(args.port, args.country)
+        serve(args.host, args.port, args.country)
         return
 
     sources = selected_sources(args.source)
@@ -734,11 +745,12 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def serve(port: int, country: str) -> None:
+def serve(host: str, port: int, country: str) -> None:
     handler = type("JobsApiHandler", (JobsApiHandler,), {"country": country})
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
-    print(f"fetchJobsForMe API on http://127.0.0.1:{port}")
-    print(f"  GET http://127.0.0.1:{port}/api/jobs?source=all&query=engineer")
+    httpd = ThreadingHTTPServer((host, port), handler)
+    display_host = "127.0.0.1" if host == "0.0.0.0" else host
+    print(f"fetchJobsForMe API on http://{display_host}:{port}")
+    print(f"  GET http://{display_host}:{port}/api/jobs?source=all&query=engineer")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
