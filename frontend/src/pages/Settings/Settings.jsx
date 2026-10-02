@@ -1,5 +1,4 @@
 import { useState } from 'react'
-import { auth } from '../../firebase'
 import WorkspacePage from '../../components/WorkspacePage'
 import usePreferences from '../../hooks/usePreferences'
 import './Settings.css'
@@ -34,20 +33,38 @@ function hintFor(options, value) {
   return options.find(([key]) => key === optionKey(value))?.[2] || ''
 }
 
+function maskApiKey(key) {
+  if (!key) return 'Not set'
+  if (key.length <= 8) return '••••••••'
+  return `${key.slice(0, 4)}••••••••${key.slice(-4)}`
+}
+
 function SearchPreferences() {
   const { preferences, status, error, save } = usePreferences()
   const [editing, setEditing] = useState(false)
+  const [showKey, setShowKey] = useState(false)
   const [draft, setDraft] = useState(null)
-  const current = draft || preferences
+
+  const current = draft || {
+    ...preferences,
+    roles: preferences?.roles || [],
+    apiKey: preferences?.apiKey || '',
+  }
 
   const begin = () => {
-    setDraft({ ...preferences, roles: [...preferences.roles] })
+    setDraft({
+      ...preferences,
+      roles: [...(preferences?.roles || [])],
+      apiKey: preferences?.apiKey || '',
+    })
     setEditing(true)
   }
+
   const cancel = () => {
     setDraft(null)
     setEditing(false)
   }
+
   const commit = async () => {
     if (await save(draft)) cancel()
   }
@@ -58,7 +75,11 @@ function SearchPreferences() {
     <div className="search-preferences">
       <div className="search-preferences-head">
         <p>Refresh uses these values when fetching and displaying jobs.</p>
-        {!editing ? <button type="button" className="settings-edit" onClick={begin}>Edit</button> : null}
+        {!editing ? (
+          <button type="button" className="settings-edit" onClick={begin}>
+            Edit
+          </button>
+        ) : null}
       </div>
 
       {error ? <p className="settings-error">{error.message}</p> : null}
@@ -66,29 +87,65 @@ function SearchPreferences() {
       {editing ? (
         <>
           <div className="settings-form">
+            <label className="is-wide">
+              <span>Job Provider API Key</span>
+              <div className="settings-input-wrap">
+                <input
+                  type={showKey ? 'text' : 'password'}
+                  value={current.apiKey || ''}
+                  placeholder="Paste your API key here..."
+                  onChange={(event) =>
+                    setDraft((value) => ({ ...value, apiKey: event.target.value.trim() }))
+                  }
+                />
+                <button
+                  type="button"
+                  className="settings-toggle-visibility"
+                  onClick={() => setShowKey((prev) => !prev)}
+                >
+                  {showKey ? 'Hide' : 'Show'}
+                </button>
+              </div>
+              <small>Your secret key used for authenticating third-party board fetch queries.</small>
+            </label>
+
             <label>
               <span>Experience</span>
               <select
                 value={optionKey(current.experience)}
-                onChange={(event) => setDraft((value) => ({
-                  ...value,
-                  experience: event.target.value === 'all' ? null : Number(event.target.value),
-                }))}
+                onChange={(event) =>
+                  setDraft((value) => ({
+                    ...value,
+                    experience: event.target.value === 'all' ? null : Number(event.target.value),
+                  }))
+                }
               >
-                {EXPERIENCE.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                {EXPERIENCE.map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
               </select>
               <small>{hintFor(EXPERIENCE, current.experience)}</small>
             </label>
+
             <label>
               <span>Posted</span>
               <select
                 value={optionKey(current.posted)}
-                onChange={(event) => setDraft((value) => ({ ...value, posted: event.target.value }))}
+                onChange={(event) =>
+                  setDraft((value) => ({ ...value, posted: event.target.value }))
+                }
               >
-                {POSTED.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                {POSTED.map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
               </select>
               <small>{hintFor(POSTED, current.posted)}</small>
             </label>
+
             <label className="is-wide">
               <span>Roles</span>
               <input
@@ -99,59 +156,70 @@ function SearchPreferences() {
                   setDraft((value) => ({ ...value, roles }))
                 }}
               />
-              <small>Leave this blank to fetch every CSE and IT role. Abbreviations are included: ML also searches Machine Learning, ML Engineer, and MLOps.</small>
+              <small>
+                Leave this blank to fetch every CSE and IT role. Abbreviations are included: ML also searches Machine Learning, ML Engineer, and MLOps.
+              </small>
             </label>
           </div>
+
           <div className="settings-actions">
-            <button type="button" className="settings-cancel" onClick={cancel} disabled={status === 'saving'}>Cancel</button>
-            <button type="button" className="settings-save" onClick={commit} disabled={status === 'saving'}>
+            <button
+              type="button"
+              className="settings-cancel"
+              onClick={cancel}
+              disabled={status === 'saving'}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="settings-save"
+              onClick={commit}
+              disabled={status === 'saving'}
+            >
               {status === 'saving' ? 'Saving…' : 'Save preferences'}
             </button>
           </div>
         </>
       ) : (
         <dl className="settings-values">
-          <div><dt>Experience</dt><dd>{labelFor(EXPERIENCE, preferences.experience)}</dd></div>
-          <div><dt>Posted</dt><dd>{labelFor(POSTED, preferences.posted)}</dd></div>
+          <div className="is-wide">
+            <dt>API Key</dt>
+            <dd className="font-mono">{maskApiKey(preferences?.apiKey)}</dd>
+          </div>
+          <div>
+            <dt>Experience</dt>
+            <dd>{labelFor(EXPERIENCE, preferences?.experience)}</dd>
+          </div>
+          <div>
+            <dt>Posted</dt>
+            <dd>{labelFor(POSTED, preferences?.posted)}</dd>
+          </div>
           <div className="is-wide">
             <dt>Roles</dt>
-            <dd>{preferences.roles.length ? preferences.roles.join(', ') : 'All CSE and IT roles'}</dd>
+            <dd>{preferences?.roles?.length ? preferences.roles.join(', ') : 'All CSE and IT roles'}</dd>
           </div>
         </dl>
       )}
 
       <p className="settings-rule">
         Select on experience keeps every experience level. Select on posted keeps the last 15 days.
-        A blank role list keeps every CSE and IT role. These three choices are used while fetching from every portal.
-        Jobs without an experience value are still included when a year limit is selected.
+        A blank role list keeps every CSE and IT role. These choices are used while fetching from portals.
       </p>
     </div>
   )
 }
 
 export default function Settings() {
-  const user = auth.currentUser
   return (
     <WorkspacePage
       eyebrow="WORKSPACE PREFERENCES"
       title="Settings"
-      description="Manage account preferences, connected services, and job-search behavior."
-      metrics={[
-        { label: 'Account', value: user ? 'Connected' : 'Not connected' },
-        { label: 'Integrations', value: '0' },
-        { label: 'Notifications', value: 'On' },
-        { label: 'Search preferences', value: 'Saved per user' },
-      ]}
-      split
+      description="Manage your API credentials and job-search criteria."
       sections={[
         {
-          title: 'Connected services',
-          description: 'Manage linked accounts and job sources.',
-          emptyMessage: 'No additional services are connected yet.',
-        },
-        {
-          title: 'Job search preferences',
-          description: 'Limit refreshed jobs by experience, age, and role.',
+          title: 'Job Search & API Preferences',
+          description: 'Configure API key, role keywords, and experience filters.',
           content: <SearchPreferences />,
         },
       ]}

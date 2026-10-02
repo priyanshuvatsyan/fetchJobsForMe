@@ -27,6 +27,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from xml.etree import ElementTree
 import os
+from Server.gemini_service import get_user_gemini_client
 
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
@@ -87,7 +88,6 @@ from connectors.WeWorkRemotely import WeWorkRemotely
 from connectors.WorkingNomads import WorkingNomads
 
 SLUG_SOURCES = {"greenhouse", "lever", "ashby"}
-# Instahyre connector code stays in tree, but live web fetch is paused (rate limits / slow).
 PAUSED_SIDECAR_KEYS = {"instahyre"}
 CONNECTORS = [
     Greenhouse,
@@ -112,12 +112,9 @@ CONNECTORS = [
 ]
 BY_KEY = {connector.key: connector for connector in CONNECTORS}
 
-# Last successful "all portals" fetch. The jobs page reads this on startup.
-# Web fetches keep India, Indian hybrid, and remote openings from this window.
 WINDOW_DAYS = POSTED_WINDOW_DAYS
 JOBS_FILE = Path(__file__).resolve().parents[1] / "data" / "jobs.json"
 _jobs_lock = threading.Lock()
-# In-memory fetch. The jobs page reads this while portals are still running.
 _progress = {
     "running": False,
     "generation": 0,
@@ -302,7 +299,6 @@ def _run_connector(
             if not job.posted_at or within_days(job.posted_at, posted_within_days)
         ]
     if publish is not None:
-        # Board portals already published each company. This call records notes.
         publish(connector, [] if streamed else jobs)
     return connector, jobs
 
@@ -318,7 +314,6 @@ def run_sources(
     posted_within_days: int | None = None,
     publish=None,
 ) -> list[tuple]:
-    """Run each connector in parallel and return (connector, jobs) in source order."""
     results = []
     with ThreadPoolExecutor(max_workers=min(6, len(sources))) as pool:
         futures = {
@@ -519,7 +514,6 @@ def print_source(connector, jobs: list[Job]) -> None:
     print_jobs(jobs, include_portal=False)
 
 
-# These flags mean "print jobs in the terminal". Anything else starts the API.
 _TERMINAL_FLAGS = (
     "--source",
     "--query",
@@ -616,7 +610,6 @@ def read_jobs_file() -> dict | None:
 
 
 def _write_json(path: Path, payload) -> None:
-    """OneDrive or an editor can lock the file for a moment. Retry, and never fail a request over it."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".json.tmp")
     body = json.dumps(payload, ensure_ascii=False)
@@ -637,7 +630,6 @@ def write_jobs_file(payload: dict) -> None:
     _write_json(JOBS_FILE, payload)
 
 
-# Starred jobs. Kept until the user removes them, so they outlive the 15-day feed window.
 SAVED_FILE = JOBS_FILE.parent / "saved_jobs.json"
 _saved_lock = threading.Lock()
 _SAVED_FIELDS = (
@@ -657,7 +649,6 @@ def read_saved() -> list[dict]:
 
 
 def _saved_record(record: dict) -> dict:
-    """Keep only the job fields the UI renders. Raises ValueError for a record that cannot be saved."""
     if not isinstance(record, dict):
         raise ValueError("job must be an object")
     link = str(record.get("link") or "").strip()
@@ -703,8 +694,6 @@ def unsave_job(link: str) -> bool:
     return True
 
 
-# Per-user job-search preferences. The Firebase uid is used only as a stable
-# local storage key; no email or other identity data is stored here.
 PREFERENCES_DIR = JOBS_FILE.parent / "preferences"
 _preferences_lock = threading.Lock()
 _POSTED_DAYS = {"today": 1, "yesterday": 2, "7days": 7, "15days": 15}
@@ -729,7 +718,6 @@ def _empty_preferences() -> dict:
 
 
 def _experience_setting(value):
-    """Select / blank means every experience level. Otherwise the ceiling is 0–5."""
     from Server.feeds import experience_cap
 
     if value is None or str(value).strip().casefold() in {"", "all", "select"}:
@@ -797,7 +785,6 @@ def update_preferences(uid: str, changes: dict) -> dict:
 
 
 def preference_days(preferences: dict) -> int:
-    """Select uses the normal 15-day window. The other choices narrow that window."""
     return _POSTED_DAYS.get(str(preferences.get("posted") or ""), WINDOW_DAYS)
 
 
@@ -848,8 +835,6 @@ def apply_preferences(payload: dict, preferences: dict) -> dict:
     return result
 
 
-# Candidate profile and resume. The profile is deliberately provider-neutral so
-# recommendations, applications, and future agents can all consume one schema.
 PROFILE_FILE = JOBS_FILE.parent / "profile.json"
 RESUME_DIR = JOBS_FILE.parent / "resume"
 MAX_RESUME_BYTES = 8 * 1024 * 1024
@@ -1011,7 +996,6 @@ def _section(text: str, headings: tuple[str, ...], stops: tuple[str, ...]) -> st
 
 
 def parse_resume(text: str) -> dict:
-    """Conservative, deterministic resume extraction. The user reviews every result."""
     text = text.replace("\x00", " ")
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
     lines = [line for line in lines if line]
@@ -1108,8 +1092,6 @@ def upload_resume(payload: dict) -> dict:
 
     with _profile_lock:
         profile = read_profile()
-        # A new resume refreshes fields it can identify and preserves preferences
-        # such as locations, work modes, salary, and manually entered values it cannot.
         for field, value in extracted.items():
             if value:
                 profile[field] = value
@@ -1146,7 +1128,6 @@ _LABEL_TO_KEY = {cls.label.casefold(): cls.key for cls in CONNECTORS}
 
 
 def with_portal_key(record: dict) -> dict:
-    """Attach the stable portal id. Saved rows that only have a display name still match."""
     if not isinstance(record, dict):
         return record
     key = (record.get("portalKey") or "").strip()
@@ -1169,7 +1150,6 @@ def with_note_key(note: dict) -> dict:
 
 
 def _portal_catalog() -> list[dict]:
-    """One row per portal: the id the UI filters on, plus live status for logs and later screens."""
     live = FEED_COORDINATOR.status()
     main_running = bool(_progress.get("running"))
     catalog = []
@@ -1227,7 +1207,6 @@ def _payload_from_progress(loading: bool, cached: bool = False) -> dict:
 
 
 def _remember(generation: int, connector, batch: list[Job], preferences: dict | None = None) -> None:
-    """Add a portal's latest jobs. Same link replaces the earlier card (Greenhouse fills the description in a second pass)."""
     with _jobs_lock:
         if generation != _progress["generation"]:
             return
@@ -1280,7 +1259,6 @@ def _finish_fetch(generation: int, error: str = "") -> None:
 
 
 def _portal_sources() -> list[type]:
-    """Portals that share jobs.json; independent feeds use sidecar JSON files."""
     return [cls for cls in CONNECTORS if getattr(cls, "persist", "") != "sidecar"]
 
 
@@ -1321,7 +1299,6 @@ def _reset_progress() -> None:
 
 
 def stop_fetches() -> dict:
-    """Stop every portal and keep the jobs already written to JSON."""
     cancel()
     from connectors.Naukri.Naukri import close_naukri_browser
 
@@ -1355,7 +1332,6 @@ def _start_main_fetch(country: str, refresh_sidecars: bool, preferences: dict) -
 
 
 def saved_or_live_jobs(country: str, refresh: bool, preferences: dict) -> dict:
-    """Return the saved file when it is complete. A new fetch returns jobs as each company comes in."""
     if refresh:
         payload = _start_main_fetch(country, True, preferences)
         return _respond(payload)
@@ -1399,7 +1375,6 @@ def saved_or_live_jobs(country: str, refresh: bool, preferences: dict) -> dict:
 
 
 def _current_view() -> dict:
-    """Jobs the page would show right now. Unlike /api/jobs this never starts a fetch."""
     with _jobs_lock:
         live = _progress["running"] or bool(_progress["jobs"])
         payload = _payload_from_progress(loading=_progress["running"]) if live else None
@@ -1409,7 +1384,6 @@ def _current_view() -> dict:
 
 
 def jobs_summary() -> dict:
-    """Numbers for Job Discovery: portals with jobs, jobs posted in 24 hours, saved jobs, last fetch."""
     view = _current_view()
     counts: dict[str, int] = {}
     new_today = 0
@@ -1441,16 +1415,15 @@ class JobsApiHandler(BaseHTTPRequestHandler):
     """JSON API for the web app. Jobs are read-only; saved jobs accept POST and DELETE."""
 
     max_body = 12 * 1024 * 1024
-
     server_version = "fetchJobsForMe"
     country = "in"
 
-    def do_OPTIONS(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+    def do_OPTIONS(self) -> None:
         self.send_response(204)
         self._send_cors()
         self.end_headers()
 
-    def do_GET(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+    def do_GET(self) -> None:
         route = urlparse(self.path)
         params = parse_qs(route.query)
         if route.path == "/api/health":
@@ -1483,7 +1456,7 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": f"unknown path {route.path}"})
             return
 
-        first = lambda name, fallback="": (params.get(name) or [fallback])[0].strip()  # noqa: E731
+        first = lambda name, fallback="": (params.get(name) or [fallback])[0].strip()
         refresh = first("refresh", "").casefold() in {"1", "true", "yes"}
         uid = first("uid")
         preferences = read_preferences(uid) if uid else _empty_preferences()
@@ -1497,14 +1470,47 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         except SystemExit as exc:
             self._send_json(400, {"error": str(exc)})
             return
-        except Exception as exc:  # a portal failure should not kill the server
+        except Exception as exc:
             event("api", "error", f"GET /api/jobs failed: {exc}")
             self._send_json(502, {"error": str(exc)})
             return
         self._send_json(200, payload)
 
-    def do_POST(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+    def do_POST(self) -> None:
         path = urlparse(self.path).path
+
+        # Gemini AI Generation Endpoint
+        if path == "/api/ai/generate":
+            auth_header = self.headers.get("Authorization")
+            try:
+                client, uid = get_user_gemini_client(auth_header)
+            except ValueError as exc:
+                self._send_json(401, {"error": str(exc)})
+                return
+            except Exception as exc:
+                self._send_json(500, {"error": f"Auth check failed: {exc}"})
+                return
+
+            body = self._read_json()
+            if body is None:
+                return
+
+            prompt = str(body.get("prompt") or "").strip()
+            if not prompt:
+                self._send_json(400, {"error": "prompt is required"})
+                return
+
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                )
+                self._send_json(200, {"result": response.text})
+            except Exception as exc:
+                event("gemini", "error", f"Generation failed for uid={uid[:8]}: {exc}")
+                self._send_json(502, {"error": f"Gemini error: {exc}"})
+            return
+
         if path == "/api/resume":
             body = self._read_json()
             if body is None:
@@ -1516,6 +1522,7 @@ class JobsApiHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(200, result)
             return
+
         if path != "/api/saved":
             self._send_json(404, {"error": f"unknown path {path}"})
             return
@@ -1529,7 +1536,7 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             return
         self._send_json(201, {"job": job, "count": len(read_saved())})
 
-    def do_PUT(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+    def do_PUT(self) -> None:
         route = urlparse(self.path)
         path = route.path
         if path not in {"/api/profile", "/api/preferences"}:
@@ -1557,7 +1564,7 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             return
         self._send_json(200, {"profile": profile})
 
-    def do_DELETE(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+    def do_DELETE(self) -> None:
         route = urlparse(self.path)
         if route.path != "/api/saved":
             self._send_json(404, {"error": f"unknown path {route.path}"})
@@ -1570,7 +1577,6 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         self._send_json(200 if removed else 404, {"removed": removed, "count": len(read_saved())})
 
     def _read_json(self):
-        """Parse a JSON request body, or send 400/413 and return None."""
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -1589,7 +1595,7 @@ class JobsApiHandler(BaseHTTPRequestHandler):
 
     def _send_cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 
     def _send_json(self, status: int, payload: dict) -> None:
