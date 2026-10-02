@@ -18,9 +18,10 @@ if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
 from Server.control import pause, stale, token
-from Server.feeds import get_store
+from Server.feeds import _matches_saved_search, get_store, role_matches, search_phrases
 from Server.api import (
     Job,
+    apply_url_from_html,
     clean,
     extract_salary,
     is_tech_role,
@@ -308,6 +309,7 @@ def extract_job_details(url: str, card_posted: str = "") -> dict:
         "about_company": "",
         "job_description": "",
         "posted_at": card_posted,
+        "apply_url": "",
     }
     try:
         response = _session.get(url, timeout=30)
@@ -351,6 +353,7 @@ def extract_job_details(url: str, card_posted: str = "") -> dict:
         "about_company": about_company,
         "job_description": job_description or plain_text(body),
         "posted_at": posted,
+        "apply_url": apply_url_from_html(response.text, url),
     }
 
 
@@ -372,9 +375,14 @@ class LinkedIn:
         open_browser: bool = False,
         on_batch=None,
         posted_within_days: int | None = None,
+        max_experience: int | None = None,
+        role_terms: list[str] | None = None,
     ) -> list[Job]:
         del boards, open_browser
         self.warnings = []
+        self.max_experience = max_experience
+        self.role_terms = [str(role).strip() for role in (role_terms or []) if str(role).strip()]
+        self.search_phrases = search_phrases(self.role_terms)
         cap = None if limit <= 0 else limit
         keywords = query.strip() or TECH_KEYWORDS
         place = where.strip()
@@ -394,11 +402,13 @@ class LinkedIn:
                 },
             )
 
+        searches_for = self.search_phrases or [keywords]
         try:
-            self._collect(
-                searches, keywords, jobs, seen_urls, page_size, cap,
-                posted_within_days, on_batch, started, epoch,
-            )
+            for keywords in searches_for:
+                self._collect(
+                    searches, keywords, jobs, seen_urls, page_size, cap,
+                    posted_within_days, on_batch, started, epoch,
+                )
         finally:
             if STORE.epoch == epoch:
                 STORE.flush()
@@ -473,6 +483,14 @@ class LinkedIn:
                             f"{basic['title']} — {basic['location']}"
                         )
                         continue
+                    if (
+                        posted_within_days
+                        and basic["posted_at"]
+                        and not within_days(basic["posted_at"], posted_within_days)
+                    ):
+                        continue
+                    if not role_matches(basic["title"] or "", "", getattr(self, "role_terms", None)):
+                        continue
                     seen_urls.add(url)
                     new_jobs += 1
 
@@ -511,7 +529,14 @@ class LinkedIn:
                         salary=details["salary"] or "",
                         about_company=details["about_company"] or "",
                         job_description=details["job_description"] or "",
+                        apply_url=details.get("apply_url") or "",
                     )
+                    if not _matches_saved_search(
+                        job,
+                        getattr(self, "max_experience", None),
+                        getattr(self, "role_terms", None) or [],
+                    ):
+                        continue
                     jobs.append(job)
                     STORE.append(job, epoch)
                     if on_batch is not None:

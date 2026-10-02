@@ -42,6 +42,7 @@ class RemoteOK:
                     company=clean(item.get("company")),
                     location=place,
                     url=clean(item.get("url") or item.get("apply_url")),
+                    apply_url=clean(item.get("apply_url")),
                     posted_at=to_datetime(item.get("epoch") or item.get("date")),
                     experience=experience,
                     skill=skill,

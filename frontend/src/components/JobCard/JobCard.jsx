@@ -100,14 +100,28 @@ const JobCard = ({ job, defaultExpanded = false, saved = false, onToggleSave }) 
 
         <div className="job-card-identity">
           <span className="job-card-kicker">Job</span>
-          <h3 className="job-card-role">{job.role}</h3>
+          <h3 className="job-card-role">
+            {job.link ? (
+              <a
+                className="job-card-role-link"
+                href={job.link}
+                target="_blank"
+                rel="noreferrer"
+                onClick={(event) => event.stopPropagation()}
+              >
+                {job.role}
+              </a>
+            ) : (
+              job.role
+            )}
+          </h3>
           <p className="job-card-company">{job.company}</p>
         </div>
 
         <div className="job-card-actions" onClick={(event) => event.stopPropagation()}>
           {job.portal ? <Badge tone="accent">{job.portal}</Badge> : null}
-          {job.link ? (
-            <Button href={job.link} size="sm" aria-label={`Apply for ${job.role} at ${job.company}`}>
+          {job.apply || job.link ? (
+            <Button href={job.apply || job.link} size="sm" aria-label={`Apply for ${job.role} at ${job.company}`}>
               Apply
               <span aria-hidden="true">↗</span>
             </Button>
@@ -153,7 +167,12 @@ const JobCard = ({ job, defaultExpanded = false, saved = false, onToggleSave }) 
 
       {hasDescription && expanded ? (
         <div className="job-card-panel" id={panelId}>
-          <JobDescription aboutCompany={job.aboutCompany} jobDescription={job.jobDescription} />
+          <JobDescription
+            aboutCompany={job.aboutCompany}
+            jobDescription={job.jobDescription}
+            openings={job.openings}
+            applicants={job.applicants}
+          />
         </div>
       ) : null}
     </article>

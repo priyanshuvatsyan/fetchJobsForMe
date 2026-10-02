@@ -48,6 +48,57 @@ class FeedParserTests(unittest.TestCase):
         self.assertEqual(job.salary, "USD 100,000–120,000/yearly")
         self.assertIn("Remote", job.location)
 
+    def test_role_abbreviations_expand_before_search(self):
+        import requests
+        from unittest.mock import patch
+
+        from Server.feeds import role_matches, search_phrases
+        from connectors.Jobicy.Jobicy import jobicy_tags
+
+        self.assertEqual(
+            search_phrases(["ML"]),
+            ["ML", "machine learning", "ml engineer", "mlops"],
+        )
+        self.assertTrue(role_matches("Machine Learning Engineer", "", ["ML"]))
+        self.assertTrue(role_matches("MLOps Engineer", "Python", ["ML"]))
+        self.assertFalse(role_matches("Email Marketing Specialist", "", ["AI"]))
+        self.assertTrue(role_matches("AI Engineer", "", ["AI"]))
+        self.assertEqual(
+            jobicy_tags(["devops", "developer", "ML"]),
+            ["devops", "software-development", "machine-learning"],
+        )
+        self.assertNotIn("ML", jobicy_tags(["ML"]))
+
+        class Response:
+            def __init__(self, status, payload):
+                self.status_code = status
+                self._payload = payload
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise requests.HTTPError("bad tag")
+
+            def json(self):
+                return self._payload
+
+        calls = []
+
+        def fake_get(url, params, headers, timeout):
+            del url, headers, timeout
+            tag = params.get("tag")
+            calls.append(tag)
+            if tag == "devops":
+                return Response(400, {})
+            return Response(200, {"jobs": [{"id": tag}]})
+
+        connector = Jobicy()
+        connector.role_terms = ["devops", "ML"]
+        with patch("connectors.Jobicy.Jobicy.requests.get", fake_get):
+            items = list(connector.iter_items("", None))
+        self.assertEqual(calls, ["devops", "machine-learning"])
+        self.assertEqual(items, [{"id": "machine-learning"}])
+        self.assertTrue(connector.warnings)
+
     def test_four_day_week_salary_is_cents(self):
         job = FourDayWeek().parse_item({
             "title": "Software Engineer",
@@ -299,6 +350,238 @@ B.Tech Computer Science, Example University
         finally:
             server.PROFILE_FILE = original_profile
             server.RESUME_DIR = original_resume
+
+
+    def test_apply_link_falls_back_to_job_url(self):
+        from Server.api import Job, apply_url_from_html
+        from Server.feeds import job_record
+
+        html = """
+        <a href="https://in.indeed.com/viewjob?jk=abc">Software Engineer</a>
+        <a href="https://jobs.acme.example/apply/42">Apply on company site</a>
+        <a href="https://accounts.google.com/signin">Apply with Google</a>
+        """
+        self.assertEqual(
+            apply_url_from_html(html, "https://in.indeed.com/viewjob?jk=abc"),
+            "https://jobs.acme.example/apply/42",
+        )
+        same = job_record(Job(
+            source="Indeed",
+            title="Software Engineer",
+            company="Acme",
+            location="Bengaluru",
+            url="https://in.indeed.com/viewjob?jk=abc",
+        ), "indeed")
+        self.assertEqual(same["apply"], same["link"])
+        separate = job_record(Job(
+            source="Indeed",
+            title="Software Engineer",
+            company="Acme",
+            location="Bengaluru",
+            url="https://in.indeed.com/viewjob?jk=abc",
+            apply_url="https://jobs.acme.example/apply/42",
+        ), "indeed")
+        self.assertEqual(separate["link"], "https://in.indeed.com/viewjob?jk=abc")
+        self.assertEqual(separate["apply"], "https://jobs.acme.example/apply/42")
+
+    def test_indeed_card_parser(self):
+        from Server.api import is_tech_role, keeps_india_hybrid_or_remote
+        from connectors.Indeed.Indeed import cards_from_html, detail_from_html, search_url
+
+        cards = cards_from_html("""
+        <div class="job_seen_beacon">
+          <h2 class="jobTitle"><a class="jcs-JobTitle" data-jk="abc123">Software Engineer</a></h2>
+          <span data-testid="company-name">Acme Labs</span>
+          <div data-testid="text-location">Hybrid work in Bengaluru, Karnataka</div>
+          <div data-testid="attribute_snippet_testid salary-snippet-container">₹10,00,000 a year</div>
+        </div>
+        <div class="job_seen_beacon">
+          <a class="jcs-JobTitle" data-jk="abc123">Software Engineer</a>
+        </div>
+        """)
+        self.assertEqual(len(cards), 1)
+        card = cards[0]
+        self.assertEqual(card["title"], "Software Engineer")
+        self.assertEqual(card["company"], "Acme Labs")
+        self.assertEqual(card["location"], "Hybrid work in Bengaluru, Karnataka")
+        self.assertEqual(card["salary"], "₹10,00,000 a year")
+        self.assertEqual(card["url"], "https://in.indeed.com/viewjob?jk=abc123")
+        self.assertTrue(is_tech_role(card["title"]))
+        self.assertTrue(keeps_india_hybrid_or_remote(card["location"]))
+        self.assertIn("l=India", search_url("software engineer", 0, remote=False, fromage=15))
+        self.assertIn("l=Remote", search_url("software engineer", 10, remote=True, fromage=1))
+        detail = detail_from_html("""
+        <script type="application/ld+json">
+        {
+          "@type": "JobPosting",
+          "title": "Software Engineer",
+          "datePosted": "2026-10-01T04:00:00Z",
+          "description": "<p>About Acme Labs.</p><p>Build services with Python. 2 years of experience.</p>",
+          "skills": ["Python", "SQL"],
+          "hiringOrganization": {"name": "Acme Labs"},
+          "jobLocation": {"address": {"addressLocality": "Bengaluru", "addressRegion": "Karnataka"}},
+          "baseSalary": {"currency": "INR", "value": {"minValue": 200000, "maxValue": 800000, "unitText": "YEAR"}}
+        }
+        </script>
+        """)
+        self.assertIn("Build services with Python", detail["description"])
+        self.assertEqual(detail["skill"], "Python, SQL")
+        self.assertEqual(detail["posted_at"], "2026-10-01 04:00:00")
+        self.assertIn("2 years", detail["experience"])
+        self.assertEqual(detail["salary"], "₹200,000 - ₹800,000 a year")
+        self.assertEqual(detail["location"], "Bengaluru, Karnataka")
+
+    def test_naukri_card_parser(self):
+        from Server.api import is_tech_role, keeps_india_hybrid_or_remote, within_days
+        from connectors.Naukri.Naukri import cards_from_html, posted_from_label, search_url
+
+        html = """
+        <div class="srp-jobtuple-wrapper" data-job-id="011026012196">
+          <h2><a class="title" href="https://www.naukri.com/job-listings-software-engineer-example-bengaluru-0-to-5-years-011026012196">Software Engineer</a></h2>
+          <a class="comp-name" title="Example Labs">Example Labs</a>
+          <span class="expwdth">0-5 Yrs</span>
+          <span class="locWdth">Remote</span>
+          <span class="sal"><span title="5-14 Lacs PA">5-14 Lacs PA</span></span>
+          <span class="job-desc">Build services with Python.</span>
+          <ul class="tags-gt"><li class="tag-li">Python</li><li class="tag-li">SQL</li></ul>
+          <span class="job-post-day">1 day ago</span>
+        </div>
+        <div class="srp-job-promotion"><span class="title">Promoted role</span></div>
+        """
+        cards = cards_from_html(html)
+        self.assertEqual(len(cards), 1)
+        card = cards[0]
+        self.assertEqual(card["title"], "Software Engineer")
+        self.assertEqual(card["company"], "Example Labs")
+        self.assertEqual(card["location"], "Remote")
+        self.assertEqual(card["experience"], "0-5 Yrs")
+        self.assertEqual(card["salary"], "5-14 Lacs PA")
+        self.assertEqual(card["skills"], ["Python", "SQL"])
+        self.assertTrue(card["url"].endswith("011026012196"))
+        self.assertTrue(is_tech_role(card["title"]))
+        self.assertTrue(keeps_india_hybrid_or_remote(card["location"]))
+        self.assertTrue(within_days(card["posted_at"], 15))
+        old = posted_from_label("30+ days ago")
+        self.assertFalse(within_days(old, 15))
+        self.assertEqual(search_url("software engineer", 1), "https://www.naukri.com/software-engineer-jobs?sort=f")
+        self.assertEqual(search_url("software engineer", 2), "https://www.naukri.com/software-engineer-jobs-2?sort=f")
+        self.assertEqual(
+            search_url("python developer", 1, remote=True),
+            "https://www.naukri.com/work-from-home-python-developer-jobs?sort=f",
+        )
+        from connectors.Naukri.Naukri import detail_from_html
+
+        detail = detail_from_html("""
+        <section id="job_header">
+          <span><label>Openings: </label><span>1</span></span>
+          <span><label>Applicants: </label><span>100+</span></span>
+        </section>
+        <section>
+          <div><h2>Job description</h2></div>
+          <div>
+            <div><p>Design CI/CD pipelines for Salesforce.</p><ul><li>Manage Git workflows.</li></ul></div>
+            <div><label>Role: </label><span>Technical Consultant</span></div>
+          </div>
+        </section>
+        <section>
+          <h2>About company</h2>
+          <div>Not mentioned</div>
+          <div><label>Address:</label><span>Bagmane Tech Park, Bengaluru</span></div>
+        </section>
+        <div><h2>Key Skills</h2><div><a><span>Copado</span></a><a><span>Git</span></a></div></div>
+        """)
+        self.assertIn("Design CI/CD pipelines", detail["description"])
+        self.assertIn("- Manage Git workflows.", detail["description"])
+        self.assertIn("Role: Technical Consultant", detail["description"])
+        self.assertEqual(detail["openings"], "1")
+        self.assertEqual(detail["applicants"], "100+")
+        self.assertEqual(detail["skills"], ["Copado", "Git"])
+        self.assertIn("Bagmane Tech Park", detail["about"])
+        plain = detail_from_html("""
+        <section>
+          <div><h2>Job description</h2></div>
+          <div>
+            <h3>Job Description</h3>
+            <div>Works in the area of Software Engineering, which encompasses the development, maintenance and optimization of software solutions/applications.</div>
+            <div>1. Applies scientific methods to analyse and solve software engineering problems.</div>
+            <h3>Job Description - Grade Specific</h3>
+            <div>Has more than a year of relevant work experience.</div>
+            <div><label>Role: </label><span>Software Development - Other</span></div>
+            <div>Education</div>
+            <div><label>UG: </label><span>Any Graduate</span></div>
+          </div>
+          <h2><span>Key Skills</span></h2>
+          <div>Skills highlighted with preferred keyskills</div>
+          <div>Maintenance</div>
+          <h3>Report this job</h3>
+          <div>Inappropriate Content</div>
+          <div>Beware of imposters!</div>
+          <div>Naukri.com does not promise a job or an interview in exchange of money.</div>
+          <div>Connect with us</div>
+          <div>Apply on the go</div>
+        </section>
+        """)
+        self.assertIn("Works in the area of Software Engineering", plain["description"])
+        self.assertIn("1. Applies scientific methods", plain["description"])
+        self.assertIn("Job Description - Grade Specific", plain["description"])
+        self.assertIn("Has more than a year of relevant work experience.", plain["description"])
+        self.assertIn("Role: Software Development - Other", plain["description"])
+        self.assertIn("UG: Any Graduate", plain["description"])
+        self.assertNotIn("Maintenance", plain["description"])
+        self.assertNotIn("Report this job", plain["description"])
+        self.assertNotIn("Beware of imposters", plain["description"])
+        self.assertNotIn("Connect with us", plain["description"])
+        self.assertNotIn("Apply on the go", plain["description"])
+
+    def test_user_search_preferences_filter_jobs(self):
+        import tempfile
+        from datetime import datetime, timedelta, timezone
+        from pathlib import Path
+
+        import Server.server as server
+
+        original = server.PREFERENCES_DIR
+        server.PREFERENCES_DIR = Path(tempfile.mkdtemp()) / "preferences"
+        try:
+            preferences = server.update_preferences("user-one", {
+                "experience": 3,
+                "posted": "today",
+                "roles": ["DevOps", "ML"],
+            })
+            self.assertEqual(server.read_preferences("user-one"), preferences)
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            old = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+            jobs = [
+                {"role": "DevOps Engineer", "experience": "3-7 Yrs", "skill": "", "added on": now},
+                {"role": "Machine Learning Engineer", "experience": "0-5 Yrs", "skill": "", "added on": now},
+                {"role": "DevOps Engineer", "experience": "", "skill": "", "added on": now},
+                {"role": "DevOps Engineer", "experience": "4-6 Yrs", "skill": "", "added on": now},
+                {"role": "DevOps Engineer", "experience": "0-2 Yrs", "skill": "", "added on": old},
+                {"role": "Backend Engineer", "experience": "0-2 Yrs", "skill": "Python", "added on": now},
+            ]
+            filtered = server.apply_preferences({"jobs": jobs}, preferences)["jobs"]
+            self.assertEqual(len(filtered), 3)
+            self.assertTrue(any(job["experience"] == "" for job in filtered))
+
+            broad = server.update_preferences("user-two", {
+                "experience": None,
+                "posted": "all",
+                "roles": [],
+            })
+            self.assertIsNone(broad["experience"])
+            self.assertEqual(broad["posted"], "all")
+            self.assertEqual(server.preference_days(broad), 15)
+            recent = (datetime.now(timezone.utc) - timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S")
+            stale = (datetime.now(timezone.utc) - timedelta(days=20)).strftime("%Y-%m-%d %H:%M:%S")
+            everything = server.apply_preferences({"jobs": [
+                {"role": "Backend Engineer", "experience": "4-6 Yrs", "skill": "Python", "added on": recent},
+                {"role": "Backend Engineer", "experience": "4-6 Yrs", "skill": "Python", "added on": stale},
+                {"role": "Data Analyst", "experience": "", "skill": "", "added on": recent},
+            ]}, broad)["jobs"]
+            self.assertEqual(len(everything), 2)
+            self.assertTrue(all(job["added on"] == recent for job in everything))
+        finally:
+            server.PREFERENCES_DIR = original
 
 
 if __name__ == "__main__":

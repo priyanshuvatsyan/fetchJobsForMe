@@ -25,7 +25,7 @@ from Server.api import (
     within_days,
 )
 from Server.control import pause, stale, token
-from Server.feeds import get_store
+from Server.feeds import _matches_saved_search, get_store, search_phrases
 
 API_URL = "https://unstop.com/api/public/opportunity/search-result"
 STORE = get_store("unstop")
@@ -214,9 +214,14 @@ class Unstop:
         boards: list[str] | None = None,
         on_batch=None,
         posted_within_days: int | None = None,
+        max_experience: int | None = None,
+        role_terms: list[str] | None = None,
     ) -> list[Job]:
         del boards
         self.warnings = []
+        self.max_experience = max_experience
+        self.role_terms = [str(role).strip() for role in (role_terms or []) if str(role).strip()]
+        self.search_phrases = search_phrases(self.role_terms)
         cap = None if limit <= 0 else limit
         place = where.strip().casefold()
         jobs: list[Job] = []
@@ -224,6 +229,31 @@ class Unstop:
         started = token()
         epoch = STORE.reset()
 
+        searches = self.search_phrases or [query.strip()]
+        for search in searches:
+            self._pages(
+                search, place, jobs, seen, started, epoch, cap, posted_within_days, on_batch,
+            )
+
+        print()
+        if STORE.epoch == epoch:
+            STORE.flush()
+        print(f"Saved {len(jobs)} jobs")
+        print(f"File: {JOBS_FILE}")
+        return jobs
+
+    def _pages(
+        self,
+        query: str,
+        place: str,
+        jobs: list[Job],
+        seen: set[str],
+        started: int,
+        epoch: int,
+        cap: int | None,
+        posted_within_days: int | None,
+        on_batch,
+    ) -> None:
         for page in range(1, MAX_PAGES + 1):
             if stale(started) or (cap is not None and len(jobs) >= cap):
                 break
@@ -281,6 +311,12 @@ class Unstop:
                     skill = format_skills(item.get("required_skills"))
                     if not skill:
                         skill = job_profile(title, body)[1]
+                    apply = clean(
+                        item.get("apply_link")
+                        or item.get("external_link")
+                        or detail.get("apply_link")
+                        or ""
+                    )
                     job = Job(
                         source=self.label,
                         title=title,
@@ -293,9 +329,16 @@ class Unstop:
                         salary=salary_text(detail),
                         about_company=about_company,
                         job_description=job_description or body,
+                        apply_url=apply,
                     )
                 except (TypeError, ValueError) as error:
                     print(f"Skipped a listing: {error}")
+                    continue
+                if not _matches_saved_search(
+                    job,
+                    getattr(self, "max_experience", None),
+                    getattr(self, "role_terms", None) or [],
+                ):
                     continue
                 jobs.append(job)
                 STORE.append(job, epoch)
@@ -307,13 +350,6 @@ class Unstop:
             last_page = int(data.get("last_page") or page)
             if page >= last_page:
                 break
-
-        print()
-        if STORE.epoch == epoch:
-            STORE.flush()
-        print(f"Saved {len(jobs)} jobs")
-        print(f"File: {JOBS_FILE}")
-        return jobs
 
 
 if __name__ == "__main__":

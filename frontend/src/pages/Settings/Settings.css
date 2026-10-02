@@ -1,0 +1,81 @@
+.search-preferences { display: grid; gap: 18px; }
+
+.search-preferences-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.search-preferences-head p,
+.settings-rule,
+.settings-muted { margin: 0; color: #7e899b; font-size: 11px; line-height: 1.55; }
+
+.settings-edit,
+.settings-cancel,
+.settings-save {
+  min-height: 34px;
+  padding: 0 14px;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.settings-edit,
+.settings-cancel { border: 1px solid #303849; background: transparent; color: #cfd5e0; }
+.settings-save { border: 0; background: #6d5dfc; color: #fff; }
+.settings-save:disabled,
+.settings-cancel:disabled { opacity: .6; cursor: progress; }
+
+.settings-form,
+.settings-values {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 17px;
+}
+
+.settings-form label { display: grid; gap: 7px; min-width: 0; }
+.settings-form .is-wide,
+.settings-values .is-wide { grid-column: 1 / -1; }
+.settings-form label > span,
+.settings-values dt { color: #9da8ba; font-size: 10px; font-weight: 650; }
+.settings-form small { color: #707c90; font-size: 9px; line-height: 1.45; }
+
+.settings-form input,
+.settings-form select {
+  width: 100%;
+  min-height: 40px;
+  padding: 0 11px;
+  border: 1px solid #2a3241;
+  border-radius: 7px;
+  outline: 0;
+  background: #111824;
+  color: #e8ecf3;
+  font: inherit;
+  font-size: 12px;
+}
+
+.settings-form input:focus,
+.settings-form select:focus { border-color: #7568ed; box-shadow: 0 0 0 3px rgba(117, 104, 237, .12); }
+.settings-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+.settings-values { margin: 0; }
+.settings-values div { padding: 13px; border: 1px solid #242b38; border-radius: 8px; background: #0d1119; }
+.settings-values dd { margin: 5px 0 0; color: #e4e9f1; font-size: 13px; line-height: 1.45; }
+.settings-rule { padding-top: 15px; border-top: 1px solid #202632; }
+.settings-error { margin: 0; color: #ff8790; font-size: 11px; }
+
+.app-root[data-theme='light'] .settings-edit,
+.app-root[data-theme='light'] .settings-cancel { border-color: #d5dce8; color: #31415c; }
+.app-root[data-theme='light'] .settings-form input,
+.app-root[data-theme='light'] .settings-form select { border-color: #dce2eb; background: #f7f8fb; color: #27344a; }
+.app-root[data-theme='light'] .settings-values div { border-color: #e2e6ed; background: #fff; }
+.app-root[data-theme='light'] .settings-values dd { color: #27344a; }
+.app-root[data-theme='light'] .settings-rule { border-color: #e2e6ed; }
+
+@media (max-width: 620px) {
+  .settings-form,
+  .settings-values { grid-template-columns: 1fr; }
+}

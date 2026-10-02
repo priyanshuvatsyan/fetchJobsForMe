@@ -42,7 +42,10 @@ export function normalizeJob(record, index = 0) {
     location: record.location || '',
     aboutCompany: description['about company'] || '',
     jobDescription: description['job description'] || '',
+    openings: description.openings || '',
+    applicants: description.applicants || '',
     link: record.link || '',
+    apply: record.apply || record.link || '',
   }
 }
 
@@ -61,8 +64,11 @@ export function toRecord(job) {
     description: {
       'about company': job.aboutCompany,
       'job description': job.jobDescription,
+      ...(job.openings ? { openings: job.openings } : {}),
+      ...(job.applicants ? { applicants: job.applicants } : {}),
     },
     link: job.link,
+    apply: job.apply || job.link,
   }
 }
 
