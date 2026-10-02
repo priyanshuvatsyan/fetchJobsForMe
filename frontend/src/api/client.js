@@ -1,4 +1,4 @@
-const BASE_URL = (import.meta.env.VITE_JOBS_API_URL || 'http://127.0.0.1:8001').replace(/\/$/, '')
+const BASE_URL = (import.meta.env.VITE_JOBS_API_URL || 'https://fetchjobsforme.onrender.com').replace(/\/$/, '')
 
 export class ApiError extends Error {
   constructor(message, status) {
