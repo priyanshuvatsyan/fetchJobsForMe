@@ -151,7 +151,21 @@ def salary_text(detail: dict) -> str:
     return f"{high or low}{period}" if (high or low) else ""
 
 
-def experience_text(detail: dict, title: str, body: str) -> str:
+_TYPES = {"in_office": "In Office", "wfh": "Remote", "remote": "Remote", "hybrid": "Hybrid"}
+_TIMINGS = {"full_time": "Full Time", "part_time": "Part Time"}
+
+
+def eligibility(item: dict) -> list[str]:
+    """The portal's Eligibility chips, e.g. Fresher, Experienced Professionals."""
+    names = [
+        clean(entry.get("name"))
+        for entry in item.get("filters") or []
+        if isinstance(entry, dict) and entry.get("type") == "eligible" and clean(entry.get("name"))
+    ]
+    return list(dict.fromkeys(names))
+
+
+def experience_text(detail: dict, title: str, body: str, item: dict | None = None) -> str:
     def years(value):
         if value in (None, ""):
             return None
@@ -167,7 +181,37 @@ def experience_text(detail: dict, title: str, body: str) -> str:
         return f"{low}+ years"
     if high is not None:
         return f"up to {high} years"
-    return job_profile(title, body)[0]
+    if any(name.casefold() == "fresher" for name in eligibility(item or {})):
+        return "Fresher"
+    return job_profile(title, plain_text(body))[0]
+
+
+def additional_information(item: dict, experience: str) -> str:
+    detail = item.get("jobDetail") or {}
+    lines = []
+    if experience:
+        lines.append(f"Experience: {experience}")
+    job_type = _TYPES.get(str(detail.get("type") or "").casefold())
+    if job_type:
+        lines.append(f"Job Type: {job_type}")
+    timing = _TIMINGS.get(str(detail.get("timing") or "").casefold())
+    if timing:
+        lines.append(f"Job Timing: {timing}")
+    days = clean(detail.get("working_days") or detail.get("workingDays"))
+    if days:
+        lines.append(f"Working Days: {days}")
+    chips = eligibility(item)
+    if chips:
+        lines.append(f"Eligibility: {', '.join(chips)}")
+    return "Additional Information\n" + "\n".join(lines) if lines else ""
+
+
+def registrations(item: dict) -> str:
+    config = item.get("opportunity_config") or {}
+    count = item.get("registerCount")
+    if not config.get("show_registrations_count") or count in (None, ""):
+        return ""
+    return clean(count)
 
 
 def job_url(item: dict) -> str:
@@ -305,8 +349,14 @@ class Unstop:
                         continue
 
                     detail = item.get("jobDetail") or {}
-                    body = plain_text(item.get("details") or "")
-                    about_company, job_description = split_description(body)
+                    details = item.get("details") or ""
+                    body = plain_text(details)
+                    about_company, job_description = split_description(details)
+                    experience = experience_text(detail, title, body, item)
+                    extra = additional_information(item, experience)
+                    job_description = "\n\n".join(
+                        part for part in (job_description or body, extra) if part
+                    )
                     organisation = item.get("organisation") or {}
                     skill = format_skills(item.get("required_skills"))
                     if not skill:
@@ -324,12 +374,13 @@ class Unstop:
                         location=location,
                         url=url,
                         posted_at=posted,
-                        experience=experience_text(detail, title, body),
+                        experience=experience,
                         skill=skill,
                         salary=salary_text(detail),
                         about_company=about_company,
-                        job_description=job_description or body,
+                        job_description=job_description,
                         apply_url=apply,
+                        applicants=registrations(item),
                     )
                 except (TypeError, ValueError) as error:
                     print(f"Skipped a listing: {error}")

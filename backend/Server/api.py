@@ -14,7 +14,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import FIRST_COMPLETED, CancelledError, ThreadPoolExecutor, wait
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 from Server.control import cancelled, token
@@ -64,6 +64,8 @@ class Job:
     openings: str = ""
     applicants: str = ""
     apply_url: str = ""
+    posted_by: str = ""
+    poster_email: str = ""
 
 
 def apply_url_from_html(html: str, page_url: str = "") -> str:
@@ -213,6 +215,110 @@ def redact_url(url: str) -> str:
 
 def clean(value) -> str:
     return " ".join(str(value or "").split())
+
+
+_EMAIL = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
+_LABELED_EMAIL = re.compile(
+    r"(?:e-?mail|contact)\s*[:\-]\s*([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})",
+    re.I,
+)
+_POSTED_BY = re.compile(
+    r"(?:posted by|job poster|recruiter|hiring manager)\s*[:\-]?\s*([A-Z][A-Za-z .'\-]{1,80})",
+    re.I,
+)
+_OPENINGS = re.compile(r"(?:openings?|vacancies)\s*[:\-]?\s*(\d+\+?)", re.I)
+_OPENINGS_TAIL = re.compile(r"(\d+\+?)\s+(?:openings?|vacancies)\b", re.I)
+_APPLICANTS = re.compile(r"(?:applicants?|applications?)\s*[:\-]?\s*(\d+\+?)", re.I)
+_APPLICANTS_TAIL = re.compile(r"(\d+\+?)\s+applicants?\b", re.I)
+_SKIP_EMAIL = ("noreply", "no-reply", "privacy@", "support@", "help@", "example.com")
+
+
+def _usable_email(value: str) -> str:
+    email = clean(value).strip(".,;:()<>")
+    if not _EMAIL.fullmatch(email):
+        return ""
+    folded = email.casefold()
+    if any(marker in folded for marker in _SKIP_EMAIL):
+        return ""
+    return email
+
+
+def _contact_name(value) -> str:
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    if isinstance(value, dict):
+        value = value.get("name") or ""
+    name = clean(value)
+    if not name or "@" in name or len(name) > 80:
+        return ""
+    return name
+
+
+def posting_facts(posting: dict | None = None, text: str = "") -> dict:
+    """Poster, email, openings, and applicants only when a portal publishes them."""
+    posting = posting or {}
+    contact = posting.get("applicationContact") or {}
+    if isinstance(contact, list):
+        contact = contact[0] if contact else {}
+    if not isinstance(contact, dict):
+        contact = {}
+    posted_by = _contact_name(contact)
+    email = _usable_email(contact.get("email") or "")
+    openings = clean(posting.get("totalJobOpenings"))
+    applicants = ""
+    source = text or ""
+    if not posted_by:
+        match = _POSTED_BY.search(source)
+        posted_by = clean(match.group(1)).rstrip(".,;") if match else ""
+    if not email:
+        match = _LABELED_EMAIL.search(source)
+        email = _usable_email(match.group(1)) if match else ""
+    if not email:
+        mailto = re.search(r"mailto:([^\"'\s>]+)", source, re.I)
+        email = _usable_email(mailto.group(1)) if mailto else ""
+    if not openings:
+        match = _OPENINGS.search(source) or _OPENINGS_TAIL.search(source)
+        openings = clean(match.group(1)) if match else ""
+    if not applicants:
+        match = _APPLICANTS.search(source) or _APPLICANTS_TAIL.search(source)
+        applicants = clean(match.group(1)) if match else ""
+    return {
+        "posted_by": posted_by,
+        "email": email,
+        "openings": openings,
+        "applicants": applicants,
+    }
+
+
+def poster_from_html(html: str) -> str:
+    """Name next to a public 'Job poster' or 'Posted by' label."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html or "", "html.parser")
+    for node in soup.find_all(string=re.compile(r"job poster|posted by", re.I)):
+        container = node.parent
+        for _ in range(3):
+            if container is None:
+                break
+            block = container.get_text("\n", strip=True)
+            if len(block) <= 180:
+                found = posting_facts({}, block)["posted_by"]
+                if found:
+                    return found
+            container = container.parent
+    return ""
+
+
+def apply_posting_facts(job: Job) -> Job:
+    """Fill empty poster and count fields from text the portal already returned."""
+    facts = posting_facts({}, f"{job.about_company}\n{job.job_description}")
+    return replace(
+        job,
+        posted_by=job.posted_by or facts["posted_by"],
+        poster_email=job.poster_email or facts["email"],
+        openings=job.openings or facts["openings"],
+        applicants=job.applicants or facts["applicants"],
+    )
 
 
 # Web fetches keep CSE/IT jobs from this window: India, Indian hybrid, or remote.

@@ -9,7 +9,14 @@ import threading
 import time
 from pathlib import Path
 
-from Server.api import Job, is_tech_role, keeps_india_hybrid_or_remote, visible_record, within_days
+from Server.api import (
+    Job,
+    apply_posting_facts,
+    is_tech_role,
+    keeps_india_hybrid_or_remote,
+    visible_record,
+    within_days,
+)
 from Server.control import held, stale, token as current_token
 
 
@@ -111,6 +118,10 @@ def _description(job: Job) -> dict:
         "about company": job.about_company,
         "job description": job.job_description,
     }
+    if job.posted_by:
+        description["posted by"] = job.posted_by
+    if job.poster_email:
+        description["email"] = job.poster_email
     if job.openings:
         description["openings"] = job.openings
     if job.applicants:
@@ -119,6 +130,7 @@ def _description(job: Job) -> dict:
 
 
 def job_record(job: Job, portal_key: str = "") -> dict:
+    job = apply_posting_facts(job)
     return {
         "portal": job.source,
         "portalKey": portal_key,
