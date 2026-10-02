@@ -1,4 +1,6 @@
-const BASE_URL = (import.meta.env.VITE_JOBS_API_URL || 'http://127.0.0.1:8001').replace(/\/$/, '')
+import { auth } from '../firebase'
+
+const BASE_URL = (import.meta.env.VITE_JOBS_API_URL || 'https://fetchjobsforme.onrender.com').replace(/\/$/, '')
 
 export class ApiError extends Error {
   constructor(message, status) {
@@ -19,6 +21,10 @@ function toQueryString(params) {
 }
 
 async function request(method, path, { params = {}, body, signal } = {}) {
+  // Retrieve Firebase ID token if user is signed in
+  const currentUser = auth.currentUser
+  const token = currentUser ? await currentUser.getIdToken() : null
+
   let response
   try {
     response = await fetch(`${BASE_URL}${path}${toQueryString(params)}`, {
@@ -27,6 +33,7 @@ async function request(method, path, { params = {}, body, signal } = {}) {
       headers: {
         Accept: 'application/json',
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     })

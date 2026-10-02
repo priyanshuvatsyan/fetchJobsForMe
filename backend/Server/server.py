@@ -27,10 +27,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from xml.etree import ElementTree
 import os
+from firebase import get_firestore_client
+
 
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
+
+from Server.gemini_service import get_user_gemini_client
 
 _LOGGER = logging.getLogger("fetchjobs")
 _LOG_ENABLED = False
@@ -95,7 +99,6 @@ from connectors.WeWorkRemotely import WeWorkRemotely
 from connectors.WorkingNomads import WorkingNomads
 
 SLUG_SOURCES = {"greenhouse", "lever", "ashby"}
-# Instahyre connector code stays in tree, but live web fetch is paused (rate limits / slow).
 PAUSED_SIDECAR_KEYS = {"instahyre"}
 CONNECTORS = [
     Greenhouse,
@@ -120,12 +123,9 @@ CONNECTORS = [
 ]
 BY_KEY = {connector.key: connector for connector in CONNECTORS}
 
-# Last successful "all portals" fetch. The jobs page reads this on startup.
-# Web fetches keep India, Indian hybrid, and remote openings from this window.
 WINDOW_DAYS = POSTED_WINDOW_DAYS
 JOBS_FILE = Path(__file__).resolve().parents[1] / "data" / "jobs.json"
 _jobs_lock = threading.Lock()
-# In-memory fetch. The jobs page reads this while portals are still running.
 _progress = {
     "running": False,
     "generation": 0,
@@ -310,7 +310,6 @@ def _run_connector(
             if not job.posted_at or within_days(job.posted_at, posted_within_days)
         ]
     if publish is not None:
-        # Board portals already published each company. This call records notes.
         publish(connector, [] if streamed else jobs)
     return connector, jobs
 
@@ -326,7 +325,6 @@ def run_sources(
     posted_within_days: int | None = None,
     publish=None,
 ) -> list[tuple]:
-    """Run each connector in parallel and return (connector, jobs) in source order."""
     results = []
     with ThreadPoolExecutor(max_workers=min(6, len(sources))) as pool:
         futures = {
@@ -530,7 +528,6 @@ def print_source(connector, jobs: list[Job]) -> None:
     print_jobs(jobs, include_portal=False)
 
 
-# These flags mean "print jobs in the terminal". Anything else starts the API.
 _TERMINAL_FLAGS = (
     "--source",
     "--query",
@@ -627,7 +624,6 @@ def read_jobs_file() -> dict | None:
 
 
 def _write_json(path: Path, payload) -> None:
-    """OneDrive or an editor can lock the file for a moment. Retry, and never fail a request over it."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".json.tmp")
     body = json.dumps(payload, ensure_ascii=False)
@@ -648,7 +644,6 @@ def write_jobs_file(payload: dict) -> None:
     _write_json(JOBS_FILE, payload)
 
 
-# Starred jobs. Kept until the user removes them, so they outlive the 15-day feed window.
 SAVED_FILE = JOBS_FILE.parent / "saved_jobs.json"
 _saved_lock = threading.Lock()
 _SAVED_FIELDS = (
@@ -668,7 +663,6 @@ def read_saved() -> list[dict]:
 
 
 def _saved_record(record: dict) -> dict:
-    """Keep only the job fields the UI renders. Raises ValueError for a record that cannot be saved."""
     if not isinstance(record, dict):
         raise ValueError("job must be an object")
     link = str(record.get("link") or "").strip()
@@ -714,8 +708,6 @@ def unsave_job(link: str) -> bool:
     return True
 
 
-# Per-user job-search preferences. The Firebase uid is used only as a stable
-# local storage key; no email or other identity data is stored here.
 PREFERENCES_DIR = JOBS_FILE.parent / "preferences"
 _preferences_lock = threading.Lock()
 _POSTED_DAYS = {"today": 1, "yesterday": 2, "7days": 7, "15days": 15}
@@ -740,7 +732,6 @@ def _empty_preferences() -> dict:
 
 
 def _experience_setting(value):
-    """Select / blank means every experience level. Otherwise the ceiling is 0–5."""
     from Server.feeds import experience_cap
 
     if value is None or str(value).strip().casefold() in {"", "all", "select"}:
@@ -808,7 +799,6 @@ def update_preferences(uid: str, changes: dict) -> dict:
 
 
 def preference_days(preferences: dict) -> int:
-    """Select uses the normal 15-day window. The other choices narrow that window."""
     return _POSTED_DAYS.get(str(preferences.get("posted") or ""), WINDOW_DAYS)
 
 
@@ -861,8 +851,7 @@ def apply_preferences(payload: dict, preferences: dict) -> dict:
 
 # Candidate profile and resume. The profile is deliberately provider-neutral so
 # recommendations, applications, and future agents can all consume one schema.
-PROFILE_FILE = JOBS_FILE.parent / "profile.json"
-RESUME_DIR = JOBS_FILE.parent / "resume"
+
 MAX_RESUME_BYTES = 8 * 1024 * 1024
 _profile_lock = threading.Lock()
 _PROFILE_TEXT_FIELDS = (
@@ -909,178 +898,627 @@ def _profile_completion(profile: dict) -> int:
     complete = sum(bool(profile.get(field)) for field in important)
     return round(complete * 100 / len(important))
 
+def _profile_document(uid: str):
+    uid = str(uid or "").strip()
 
-def read_profile() -> dict:
+    if not uid:
+        raise ValueError("authenticated user UID is required")
+
+    return (
+        get_firestore_client()
+        .collection("users")
+        .document(uid)
+        .collection("jobProfile")
+        .document("default")
+    )
+
+def read_profile(uid: str) -> dict:
     profile = _empty_profile()
+
     try:
-        payload = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        snapshot = _profile_document(uid).get()
+        payload = snapshot.to_dict() if snapshot.exists else {}
+    except Exception as exc:
+        event(
+            "profile",
+            "error",
+            f"profile read failed uid={uid}: {exc}",
+        )
+        raise ValueError("could not read profile") from exc
+
+    if not isinstance(payload, dict):
         payload = {}
-    if isinstance(payload, dict):
-        for field in _PROFILE_TEXT_FIELDS:
-            if isinstance(payload.get(field), str):
-                profile[field] = payload[field]
-        for field in _PROFILE_LIST_FIELDS:
-            if isinstance(payload.get(field), list):
-                profile[field] = [str(item).strip() for item in payload[field] if str(item).strip()]
-        for field in _PROFILE_BOOL_FIELDS:
-            profile[field] = bool(payload.get(field))
-        if isinstance(payload.get("resume"), dict):
-            profile["resume"] = payload["resume"]
-        profile["updatedAt"] = str(payload.get("updatedAt") or "")
+
+    for field in _PROFILE_TEXT_FIELDS:
+        value = payload.get(field)
+        if isinstance(value, str):
+            profile[field] = value
+
+    for field in _PROFILE_LIST_FIELDS:
+        value = payload.get(field)
+
+        if isinstance(value, list):
+            profile[field] = list(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in value
+                    if str(item).strip()
+                )
+            )[:100]
+
+    for field in _PROFILE_BOOL_FIELDS:
+        profile[field] = bool(payload.get(field, False))
+
+    resume = payload.get("resume")
+
+    if isinstance(resume, dict):
+        profile["resume"] = resume
+
+    profile["updatedAt"] = str(payload.get("updatedAt") or "")
     profile["completion"] = _profile_completion(profile)
+
     return profile
 
-
-def update_profile(changes: dict) -> dict:
+def update_profile(uid: str, changes: dict) -> dict:
     if not isinstance(changes, dict):
         raise ValueError("profile must be an object")
+
+    uid = str(uid or "").strip()
+
+    if not uid:
+        raise ValueError("authenticated user UID is required")
+
     with _profile_lock:
-        profile = read_profile()
+        profile = read_profile(uid)
+
         for field in _PROFILE_TEXT_FIELDS:
             if field in changes:
-                profile[field] = str(changes[field] or "").strip()[:10_000]
+                profile[field] = str(
+                    changes[field] or ""
+                ).strip()[:10_000]
+
         for field in _PROFILE_LIST_FIELDS:
             if field not in changes:
                 continue
+
             value = changes[field]
+
             if not isinstance(value, list):
                 raise ValueError(f"{field} must be a list")
-            profile[field] = list(dict.fromkeys(
-                str(item).strip()[:120] for item in value if str(item).strip()
-            ))[:100]
+
+            profile[field] = list(
+                dict.fromkeys(
+                    str(item).strip()[:120]
+                    for item in value
+                    if str(item).strip()
+                )
+            )[:100]
+
         for field in _PROFILE_BOOL_FIELDS:
             if field in changes:
                 profile[field] = bool(changes[field])
-        profile["updatedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        profile.pop("completion", None)
-        _write_json(PROFILE_FILE, profile)
-    event("profile", "info", "profile updated")
-    return read_profile()
 
+        profile["updatedAt"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        profile.pop("completion", None)
+
+        try:
+            _profile_document(uid).set(profile, merge=True)
+        except Exception as exc:
+            event(
+                "profile",
+                "error",
+                f"profile update failed uid={uid}: {exc}",
+            )
+            raise ValueError("could not update profile") from exc
+
+    event("profile", "info", f"profile updated uid={uid}")
+
+    return read_profile(uid)
 
 def _resume_text(content: bytes, suffix: str) -> str:
+    suffix = suffix.casefold()
+
     if suffix == ".txt":
         return content.decode("utf-8", errors="replace")
+
     if suffix == ".docx":
-        try:
-            with zipfile.ZipFile(io.BytesIO(content)) as archive:
-                xml = archive.read("word/document.xml")
-            root = ElementTree.fromstring(xml)
-        except (KeyError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
-            raise ValueError("invalid DOCX resume") from exc
-        paragraphs = []
-        for paragraph in root.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"):
-            text = "".join(
-                node.text or ""
-                for node in paragraph.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t")
-            ).strip()
-            if text:
-                paragraphs.append(text)
-        return "\n".join(paragraphs)
+        return _docx_resume_text(content)
+
     if suffix == ".pdf":
-        try:
-            from pypdf import PdfReader
-        except ImportError as exc:
-            raise ValueError("PDF parsing requires the pypdf package from backend/requirements.txt") from exc
-        try:
-            reader = PdfReader(io.BytesIO(content), strict=False)
-            if reader.is_encrypted:
-                reader.decrypt("")
-            pages = []
-            for page in reader.pages:
-                pages.append(page.extract_text() or "")
-            text = "\n".join(pages).strip()
-            if not text:
-                raise ValueError("This PDF has no selectable text. Export it as DOCX, or upload a text-based PDF.")
-            return text
-        except ValueError:
-            raise
-        except Exception as exc:
-            event("profile", "error", f"pdf parse failed: {exc}")
-            raise ValueError(
-                "This PDF could not be read. Export it as DOCX, or use a PDF with selectable text."
-            ) from exc
+        return _pdf_resume_text(content)
+
     raise ValueError("resume must be a PDF, DOCX, or TXT file")
 
+def _docx_resume_text(content: bytes) -> str:
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            xml = archive.read("word/document.xml")
 
-def _section(text: str, headings: tuple[str, ...], stops: tuple[str, ...]) -> str:
-    lines = [line.strip() for line in text.splitlines()]
-    start = next(
-        (index + 1 for index, line in enumerate(lines) if line.casefold().rstrip(":") in headings),
-        None,
+        root = ElementTree.fromstring(xml)
+
+    except (
+        KeyError,
+        zipfile.BadZipFile,
+        ElementTree.ParseError,
+    ) as exc:
+        raise ValueError("invalid DOCX resume") from exc
+
+    namespace = (
+        "{http://schemas.openxmlformats.org/"
+        "wordprocessingml/2006/main}"
     )
-    if start is None:
-        return ""
-    selected = []
-    for line in lines[start:]:
-        folded = line.casefold().rstrip(":")
-        if folded in stops:
+
+    paragraphs = []
+
+    for paragraph in root.iter(f"{namespace}p"):
+        text = "".join(
+            node.text or ""
+            for node in paragraph.iter(f"{namespace}t")
+        ).strip()
+
+        if text:
+            paragraphs.append(text)
+
+    extracted = "\n".join(paragraphs).strip()
+
+    if len(extracted) < 20:
+        raise ValueError(
+            "could not extract enough text from the DOCX resume"
+        )
+
+    return extracted
+
+def _pdf_resume_text(content: bytes) -> str:
+    errors = []
+
+    # First parser: pypdf
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(content), strict=False)
+
+        if reader.is_encrypted:
+            decrypt_result = reader.decrypt("")
+
+            if decrypt_result == 0:
+                raise ValueError(
+                    "password-protected PDF is not supported"
+                )
+
+        pages = []
+
+        for page in reader.pages:
+            try:
+                text = page.extract_text(
+                    extraction_mode="layout"
+                ) or ""
+            except TypeError:
+                # For older pypdf versions without extraction_mode.
+                text = page.extract_text() or ""
+
+            if text.strip():
+                pages.append(text)
+
+        extracted = "\n".join(pages).strip()
+
+        if len(extracted) >= 20:
+            return extracted
+
+        errors.append("pypdf returned insufficient text")
+
+    except Exception as exc:
+        errors.append(f"pypdf: {exc}")
+
+    # Second parser: PyMuPDF
+    try:
+        import fitz
+
+        document = fitz.open(
+            stream=content,
+            filetype="pdf",
+        )
+
+        pages = []
+
+        for page in document:
+            blocks = page.get_text("blocks")
+            blocks.sort(key=lambda block: (block[1], block[0]))
+
+            page_text = "\n".join(
+                str(block[4]).strip()
+                for block in blocks
+                if len(block) > 4 and str(block[4]).strip()
+            )
+
+            if page_text:
+                pages.append(page_text)
+
+        document.close()
+
+        extracted = "\n".join(pages).strip()
+
+        if len(extracted) >= 20:
+            return extracted
+
+        errors.append("PyMuPDF returned insufficient text")
+
+    except Exception as exc:
+        errors.append(f"PyMuPDF: {exc}")
+
+    event(
+        "profile",
+        "error",
+        "PDF extraction failed: " + "; ".join(errors),
+    )
+
+    raise ValueError(
+        "This PDF contains insufficient selectable text. "
+        "Upload a text-based PDF or DOCX file. "
+        "A scanned or image-only PDF requires OCR."
+    )
+
+
+import re
+from typing import Optional
+
+
+# Canonical headings supported by the parser.
+_SECTION_HEADINGS = {
+    "summary": {
+        "summary",
+        "profile",
+        "professional summary",
+        "career summary",
+        "executive summary",
+        "about me",
+    },
+    "skills": {
+        "skills",
+        "skill summary",
+        "skills summary",
+        "technical skills",
+        "core skills",
+        "core competencies",
+        "technologies",
+        "technical expertise",
+    },
+    "experience": {
+        "experience",
+        "work experience",
+        "professional experience",
+        "employment",
+        "employment history",
+        "work history",
+        "career history",
+    },
+    "certifications": {
+        "certification",
+        "certifications",
+        "certifications and achievements",
+        "certifications & achievements",
+        "achievements",
+        "awards",
+        "awards and achievements",
+        "awards & achievements",
+    },
+    "education": {
+        "education",
+        "academic background",
+        "academic qualifications",
+        "qualifications",
+        "educational qualifications",
+    },
+    "projects": {
+        "projects",
+        "project experience",
+        "personal projects",
+        "academic projects",
+    },
+}
+
+def _normalize_heading(value: str) -> str:
+    value = str(value or "").strip()
+
+    value = re.sub(r"^[\s#*_•\-–—:|]+", "", value)
+    value = re.sub(r"[\s#*_•\-–—:|]+$", "", value)
+    value = re.sub(r"\s*&\s*", " and ", value)
+    value = re.sub(r"\s+", " ", value)
+
+    return value.casefold().strip()
+
+def _heading_type(line: str) -> Optional[str]:
+    normalized = _normalize_heading(line)
+
+    if not normalized or len(normalized) > 80:
+        return None
+
+    for section_type, headings in _SECTION_HEADINGS.items():
+        normalized_headings = {
+            _normalize_heading(heading)
+            for heading in headings
+        }
+
+        if normalized in normalized_headings:
+            return section_type
+
+    return None
+
+def _clean_resume_lines(text: str) -> list[str]:
+    text = str(text or "").replace("\x00", " ")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    cleaned = []
+
+    for raw_line in text.splitlines():
+        line = re.sub(r"[ \t]+", " ", raw_line).strip()
+
+        line = re.sub(r"^\*+\s*", "", line)
+        line = re.sub(r"\s*\*+$", "", line)
+
+        if line:
+            cleaned.append(line)
+
+    return cleaned
+
+def _extract_section(lines: list[str], section_name: str) -> str:
+    """
+    Extract one section and stop at the next recognized heading.
+
+    This prevents Certifications, Achievements and Education from being
+    included in experience history.
+    """
+    start_index = None
+
+    for index, line in enumerate(lines):
+        if _heading_type(line) == section_name:
+            start_index = index + 1
             break
+
+    if start_index is None:
+        return ""
+
+    selected = []
+
+    for line in lines[start_index:]:
+        if _heading_type(line) is not None:
+            break
+
         selected.append(line)
+
     return "\n".join(selected).strip()[:10_000]
 
 
-def parse_resume(text: str) -> dict:
-    """Conservative, deterministic resume extraction. The user reviews every result."""
-    text = text.replace("\x00", " ")
-    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
-    lines = [line for line in lines if line]
-    joined = "\n".join(lines)
-    email = re.search(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", joined)
-    phone = re.search(r"(?<!\d)(?:\+?91[\s-]?)?[6-9]\d{9}(?!\d)", re.sub(r"[() ]", "", joined))
-    urls = re.findall(r"https?://[^\s|,;]+|(?:linkedin\.com|github\.com)/[^\s|,;]+", joined, re.I)
+def _looks_like_contact_line(line: str) -> bool:
+    folded = line.casefold()
 
-    name = ""
-    for line in lines[:8]:
-        if "@" in line or re.search(r"\d{6,}", line) or "http" in line.casefold():
-            continue
-        words = line.split()
-        if 2 <= len(words) <= 5 and len(line) <= 70:
-            name = line
+    return bool(
+        "@" in line
+        or "linkedin" in folded
+        or "github" in folded
+        or re.search(r"\+?\d[\d\s\-()]{8,}", line)
+    )
+
+
+def _extract_name(lines: list[str]) -> str:
+    for line in lines[:10]:
+        if _heading_type(line):
             break
+
+        if _looks_like_contact_line(line):
+            continue
+
+        candidate = re.sub(
+            r"\b(?:email|mobile|phone|linkedin)\s*:.*$",
+            "",
+            line,
+            flags=re.I,
+        ).strip()
+
+        words = candidate.split()
+
+        if (
+            2 <= len(words) <= 5
+            and len(candidate) <= 70
+            and not re.search(r"\d", candidate)
+        ):
+            return candidate.title() if candidate.isupper() else candidate
+
+    return ""
+
+def _extract_current_employment(
+    experience_text: str,
+) -> tuple[str, str]:
+
+    lines = [
+        re.sub(r"\s+", " ", line).strip()
+        for line in experience_text.splitlines()
+        if line.strip()
+    ]
+
+    if not lines:
+        return "", ""
 
     title = ""
-    start = lines.index(name) + 1 if name in lines else 0
-    for line in lines[start:start + 6]:
-        if "@" not in line and not re.search(r"\d{6,}", line) and len(line) <= 100:
-            title = line
+    company = ""
+
+    for line in lines[:5]:
+
+        if line.lower().startswith("client:"):
+            continue
+
+        if line.startswith(("•", "-", "*")):
+            continue
+
+        header = line
+
+        match = re.match(
+            r"^(?P<title>.+?)\s*(?:—|–|-| at )\s*(?P<company>.+)$",
+            header,
+            re.I,
+        )
+
+        if match:
+            title = match.group("title").strip()
+            company_text = match.group("company").strip()
+
+            company = company_text.split(",")[0].strip()
             break
 
-    skills = [
-        skill for skill in _SKILL_TERMS
-        if re.search(rf"(?<![a-z0-9]){re.escape(skill.casefold())}(?![a-z0-9])", joined.casefold())
-    ]
-    years = re.findall(r"(\d{1,2}(?:\.\d+)?)\s*\+?\s*years?", joined, re.I)
-    numeric_years = [float(value) for value in years if float(value) <= 50]
-    total_experience = f"{max(numeric_years):g} years" if numeric_years else ""
-    linkedin = next((url for url in urls if "linkedin.com" in url.casefold()), "")
-    github = next((url for url in urls if "github.com" in url.casefold()), "")
-    portfolio = next((url for url in urls if url not in {linkedin, github}), "")
-    all_headings = (
-        "experience", "work experience", "professional experience", "employment",
-        "education", "academic background", "qualifications", "skills",
-        "technical skills", "projects", "certifications", "summary", "profile",
+        parts = [p.strip() for p in header.split(",") if p.strip()]
+
+        if len(parts) >= 2:
+            title = parts[0]
+            company = parts[1]
+            break
+
+    return title[:150], company[:150]
+def _extract_total_experience(
+    text: str,
+    summary: str,
+) -> str:
+
+    search_text = summary or text
+
+    patterns = (
+        r"\b(?:over|more than)\s+(?P<value>\d+(?:\.\d+)?)\s+years?\b",
+        r"\b(?P<value>\d+(?:\.\d+)?)\s*\+?\s+years?(?:\s+of)?\s+(?:professional\s+)?experience\b",
+        r"\bexperience\s+of\s+(?P<value>\d+(?:\.\d+)?)\s*\+?\s+years?\b",
+        r"\b(?P<article>an|one)\s+year\s+of\s+experience\b",
     )
-    experience = _section(
+
+    for pattern in patterns:
+
+        match = re.search(pattern, search_text, re.I)
+
+        if not match:
+            continue
+
+        if match.groupdict().get("value"):
+            value = float(match.group("value"))
+
+            if 0 < value <= 50:
+                return f"{value:g} years"
+
+        if match.groupdict().get("article"):
+            return "1 year"
+
+    return ""
+
+
+def _extract_notice_period(text: str) -> str:
+    patterns = (
+        r"\bnotice period\s*[:\-]?\s*([^\n|,;]+)",
+        r"\b(?:available|availability)\s*[:\-]?\s*([^\n|,;]+)",
+        r"\b(immediate joiner)\b",
+        r"\b(serving notice period)\b",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+
+        if match:
+            value = match.group(1).strip()
+            return value[:120]
+
+    return ""
+
+def _extract_skills(skills_text: str, full_text: str) -> list[str]:
+
+    source_text = skills_text or full_text
+    folded = source_text.casefold()
+
+    discovered = []
+
+    for skill in _SKILL_TERMS:
+
+        pattern = (
+            rf"(?<![a-z0-9])"
+            rf"{re.escape(skill.casefold())}"
+            rf"(?![a-z0-9])"
+        )
+
+        if re.search(pattern, folded):
+            discovered.append(skill)
+
+    return discovered
+def parse_resume(text: str) -> dict:
+
+    lines = _clean_resume_lines(text)
+    joined = "\n".join(lines)
+
+    email_match = re.search(
+        r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+",
         joined,
-        ("experience", "work experience", "professional experience", "employment"),
-        all_headings,
     )
-    education = _section(
+
+    phone_match = re.search(
+        r"(?<!\d)(?:\+?91[\s-]?)?[6-9]\d{9}(?!\d)",
         joined,
-        ("education", "academic background", "qualifications"),
-        all_headings,
     )
-    summary = _section(joined, ("summary", "profile", "professional summary"), all_headings)
+
+    urls = re.findall(
+        r"https?://[^\s|,;]+|(?:linkedin\.com|github\.com)/[^\s|,;]+",
+        joined,
+        re.I,
+    )
+
+    summary = _extract_section(lines, "summary")
+    skills_text = _extract_section(lines, "skills")
+    experience = _extract_section(lines, "experience")
+    education = _extract_section(lines, "education")
+
+    current_title, current_company = _extract_current_employment(
+        experience
+    )
+
+    skills = _extract_skills(
+        skills_text,
+        joined,
+    )
+
+    linkedin = next(
+        (
+            url.rstrip(".)]")
+            for url in urls
+            if "linkedin.com" in url.casefold()
+        ),
+        "",
+    )
+
+    github = next(
+        (
+            url.rstrip(".)]")
+            for url in urls
+            if "github.com" in url.casefold()
+        ),
+        "",
+    )
+
+    portfolio = next(
+        (
+            url.rstrip(".)]")
+            for url in urls
+            if url not in {linkedin, github}
+        ),
+        "",
+    )
+
     return {
-        "fullName": name,
-        "email": email.group(0) if email else "",
-        "phone": phone.group(0) if phone else "",
-        "headline": title,
-        "currentTitle": title,
+        "fullName": _extract_name(lines),
+        "email": email_match.group(0) if email_match else "",
+        "phone": phone_match.group(0) if phone_match else "",
+        "headline": current_title,
+        "currentTitle": current_title,
+        "currentCompany": current_company,
         "summary": summary,
-        "totalExperience": total_experience,
+        "totalExperience": _extract_total_experience(
+            joined,
+            summary,
+        ),
+        "noticePeriod": _extract_notice_period(joined),
         "skills": skills,
         "linkedin": linkedin,
         "github": github,
@@ -1090,53 +1528,114 @@ def parse_resume(text: str) -> dict:
     }
 
 
-def upload_resume(payload: dict) -> dict:
+def upload_resume(uid: str, payload: dict) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("resume payload must be an object")
-    filename = Path(str(payload.get("filename") or "")).name
+
+    uid = str(uid or "").strip()
+
+    if not uid:
+        raise ValueError("authenticated user UID is required")
+
+    filename = Path(
+        str(payload.get("filename") or "")
+    ).name
+
     suffix = Path(filename).suffix.casefold()
+
+    if suffix not in {".pdf", ".docx", ".txt"}:
+        raise ValueError(
+            "resume must be a PDF, DOCX, or TXT file"
+        )
+
     encoded = payload.get("content")
+
     if not isinstance(encoded, str):
         raise ValueError("resume content is required")
+
     try:
-        content = base64.b64decode(encoded, validate=True)
+        content = base64.b64decode(
+            encoded,
+            validate=True,
+        )
     except (binascii.Error, ValueError) as exc:
-        raise ValueError("resume content must be base64") from exc
+        raise ValueError(
+            "resume content must be valid base64"
+        ) from exc
+
     if not content:
         raise ValueError("resume is empty")
+
     if len(content) > MAX_RESUME_BYTES:
-        raise ValueError("resume must be 8 MB or smaller")
+        raise ValueError(
+            "resume must be 8 MB or smaller"
+        )
 
     text = _resume_text(content, suffix)
+
     if len(text.strip()) < 20:
-        raise ValueError("could not extract enough text from this resume")
+        raise ValueError(
+            "could not extract enough text from this resume"
+        )
+
     extracted = parse_resume(text)
-    RESUME_DIR.mkdir(parents=True, exist_ok=True)
-    for old in RESUME_DIR.glob("resume.*"):
-        old.unlink(missing_ok=True)
-    resume_path = RESUME_DIR / f"resume{suffix}"
-    resume_path.write_bytes(content)
+
+    uploaded_at = datetime.now(
+        timezone.utc
+    ).isoformat()
 
     with _profile_lock:
-        profile = read_profile()
-        # A new resume refreshes fields it can identify and preserves preferences
-        # such as locations, work modes, salary, and manually entered values it cannot.
+        profile = read_profile(uid)
+
+        # Update only fields that were successfully extracted.
+        # Existing manually entered data remains unchanged when
+        # the parser cannot identify a value.
         for field, value in extracted.items():
             if value:
                 profile[field] = value
-        uploaded = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
         profile["resume"] = {
             "filename": filename,
             "size": len(content),
-            "uploadedAt": uploaded,
+            "uploadedAt": uploaded_at,
             "type": suffix.lstrip(".").upper(),
         }
-        profile["updatedAt"] = uploaded
-        profile.pop("completion", None)
-        _write_json(PROFILE_FILE, profile)
-    event("profile", "info", f"resume uploaded filename={filename} bytes={len(content)}")
-    return {"profile": read_profile(), "extracted": extracted}
 
+        profile["updatedAt"] = uploaded_at
+        profile.pop("completion", None)
+
+        try:
+            _profile_document(uid).set(
+                profile,
+                merge=True,
+            )
+        except Exception as exc:
+            event(
+                "profile",
+                "error",
+                (
+                    "resume profile save failed "
+                    f"uid={uid}: {exc}"
+                ),
+            )
+            raise ValueError(
+                "could not save parsed resume profile"
+            ) from exc
+
+    event(
+        "profile",
+        "info",
+        (
+            f"resume parsed uid={uid} "
+            f"filename={filename} "
+            f"bytes={len(content)}"
+        ),
+    )
+
+    return {
+        "profile": read_profile(uid),
+        "extracted": extracted,
+    }
 
 SNAPSHOT_VERSION = 3
 
@@ -1157,7 +1656,6 @@ _LABEL_TO_KEY = {cls.label.casefold(): cls.key for cls in CONNECTORS}
 
 
 def with_portal_key(record: dict) -> dict:
-    """Attach the stable portal id. Saved rows that only have a display name still match."""
     if not isinstance(record, dict):
         return record
     key = (record.get("portalKey") or "").strip()
@@ -1180,7 +1678,6 @@ def with_note_key(note: dict) -> dict:
 
 
 def _portal_catalog() -> list[dict]:
-    """One row per portal: the id the UI filters on, plus live status for logs and later screens."""
     live = FEED_COORDINATOR.status()
     main_running = bool(_progress.get("running"))
     catalog = []
@@ -1238,7 +1735,6 @@ def _payload_from_progress(loading: bool, cached: bool = False) -> dict:
 
 
 def _remember(generation: int, connector, batch: list[Job], preferences: dict | None = None) -> None:
-    """Add a portal's latest jobs. Same link replaces the earlier card (Greenhouse fills the description in a second pass)."""
     with _jobs_lock:
         if generation != _progress["generation"]:
             return
@@ -1291,7 +1787,6 @@ def _finish_fetch(generation: int, error: str = "") -> None:
 
 
 def _portal_sources() -> list[type]:
-    """Portals that share jobs.json; independent feeds use sidecar JSON files."""
     return [cls for cls in CONNECTORS if getattr(cls, "persist", "") != "sidecar"]
 
 
@@ -1332,7 +1827,6 @@ def _reset_progress() -> None:
 
 
 def stop_fetches() -> dict:
-    """Stop every portal and keep the jobs already written to JSON."""
     cancel()
     from connectors.Naukri.Naukri import close_naukri_browser
 
@@ -1366,7 +1860,6 @@ def _start_main_fetch(country: str, refresh_sidecars: bool, preferences: dict) -
 
 
 def saved_or_live_jobs(country: str, refresh: bool, preferences: dict) -> dict:
-    """Return the saved file when it is complete. A new fetch returns jobs as each company comes in."""
     if refresh:
         payload = _start_main_fetch(country, True, preferences)
         return _respond(payload)
@@ -1410,7 +1903,6 @@ def saved_or_live_jobs(country: str, refresh: bool, preferences: dict) -> dict:
 
 
 def _current_view() -> dict:
-    """Jobs the page would show right now. Unlike /api/jobs this never starts a fetch."""
     with _jobs_lock:
         live = _progress["running"] or bool(_progress["jobs"])
         payload = _payload_from_progress(loading=_progress["running"]) if live else None
@@ -1420,7 +1912,6 @@ def _current_view() -> dict:
 
 
 def jobs_summary() -> dict:
-    """Numbers for Job Discovery: portals with jobs, jobs posted in 24 hours, saved jobs, last fetch."""
     view = _current_view()
     counts: dict[str, int] = {}
     new_today = 0
@@ -1452,16 +1943,15 @@ class JobsApiHandler(BaseHTTPRequestHandler):
     """JSON API for the web app. Jobs are read-only; saved jobs accept POST and DELETE."""
 
     max_body = 12 * 1024 * 1024
-
     server_version = "fetchJobsForMe"
     country = "in"
 
-    def do_OPTIONS(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+    def do_OPTIONS(self) -> None:
         self.send_response(204)
         self._send_cors()
         self.end_headers()
 
-    def do_GET(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+    def do_GET(self) -> None:
         route = urlparse(self.path)
         params = parse_qs(route.query)
         if route.path == "/api/health":
@@ -1494,7 +1984,7 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": f"unknown path {route.path}"})
             return
 
-        first = lambda name, fallback="": (params.get(name) or [fallback])[0].strip()  # noqa: E731
+        first = lambda name, fallback="": (params.get(name) or [fallback])[0].strip()
         refresh = first("refresh", "").casefold() in {"1", "true", "yes"}
         uid = first("uid")
         preferences = read_preferences(uid) if uid else _empty_preferences()
@@ -1508,14 +1998,47 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         except SystemExit as exc:
             self._send_json(400, {"error": str(exc)})
             return
-        except Exception as exc:  # a portal failure should not kill the server
+        except Exception as exc:
             event("api", "error", f"GET /api/jobs failed: {exc}")
             self._send_json(502, {"error": str(exc)})
             return
         self._send_json(200, payload)
 
-    def do_POST(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+    def do_POST(self) -> None:
         path = urlparse(self.path).path
+
+        # Gemini AI Generation Endpoint
+        if path == "/api/ai/generate":
+            auth_header = self.headers.get("Authorization")
+            try:
+                client, uid = get_user_gemini_client(auth_header)
+            except ValueError as exc:
+                self._send_json(401, {"error": str(exc)})
+                return
+            except Exception as exc:
+                self._send_json(500, {"error": f"Auth check failed: {exc}"})
+                return
+
+            body = self._read_json()
+            if body is None:
+                return
+
+            prompt = str(body.get("prompt") or "").strip()
+            if not prompt:
+                self._send_json(400, {"error": "prompt is required"})
+                return
+
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                )
+                self._send_json(200, {"result": response.text})
+            except Exception as exc:
+                event("gemini", "error", f"Generation failed for uid={uid[:8]}: {exc}")
+                self._send_json(502, {"error": f"Gemini error: {exc}"})
+            return
+
         if path == "/api/resume":
             body = self._read_json()
             if body is None:
@@ -1527,6 +2050,7 @@ class JobsApiHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(200, result)
             return
+
         if path != "/api/saved":
             self._send_json(404, {"error": f"unknown path {path}"})
             return
@@ -1540,7 +2064,7 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             return
         self._send_json(201, {"job": job, "count": len(read_saved())})
 
-    def do_PUT(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+    def do_PUT(self) -> None:
         route = urlparse(self.path)
         path = route.path
         if path not in {"/api/profile", "/api/preferences"}:
@@ -1568,7 +2092,7 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             return
         self._send_json(200, {"profile": profile})
 
-    def do_DELETE(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+    def do_DELETE(self) -> None:
         route = urlparse(self.path)
         if route.path != "/api/saved":
             self._send_json(404, {"error": f"unknown path {route.path}"})
@@ -1581,7 +2105,6 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         self._send_json(200 if removed else 404, {"removed": removed, "count": len(read_saved())})
 
     def _read_json(self):
-        """Parse a JSON request body, or send 400/413 and return None."""
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -1600,7 +2123,7 @@ class JobsApiHandler(BaseHTTPRequestHandler):
 
     def _send_cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 
     def _send_json(self, status: int, payload: dict) -> None:
