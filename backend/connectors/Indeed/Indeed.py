@@ -7,7 +7,8 @@ view page supplies the description. No login and no attempt to get past a block.
 from __future__ import annotations
 
 import json
-from urllib.parse import urlencode
+import re
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -16,6 +17,8 @@ from Server.api import (
     Job,
     clean,
     apply_url_from_html,
+    poster_from_html,
+    posting_facts,
     extract_experience,
     format_skills,
     is_tech_role,
@@ -66,12 +69,51 @@ def search_url(query: str, start: int, *, remote: bool, fromage: int) -> str:
     return f"{BASE_URL}/jobs?{urlencode(params)}"
 
 
-def _blocked(html: str) -> bool:
-    head = (html or "")[:5000].casefold()
-    return any(
-        phrase in head
-        for phrase in ("additional verification", "just a moment", "cf-browser-verification")
-    )
+BLOCKED_NOTE = (
+    "Indeed is showing a Cloudflare security check to this network, so job descriptions "
+    "were not loaded. Jobs found before the check are kept. Try again later."
+)
+
+
+def _blocked(html: str, status: int = 200) -> bool:
+    text = (html or "").casefold()
+    head = text[:5000]
+    challenge = any(
+        marker in text
+        for marker in ("cf-browser-verification", "cf-box-container", "/cdn-cgi/challenge-platform")
+    ) or any(phrase in head for phrase in ("additional verification", "just a moment"))
+    return status in (403, 429) or challenge
+
+
+_HEX_RUN = "0123456789abcdef" * 2
+
+
+def _trap_key(job_key: str) -> bool:
+    """Indeed plants sequential hex keys in the results. Those view pages 404."""
+    folded = (job_key or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{8,}", folded):
+        return False
+    return folded in _HEX_RUN or folded in _HEX_RUN[::-1]
+
+
+def _hidden(node) -> bool:
+    current = node
+    for _ in range(6):
+        if current is None or not getattr(current, "attrs", None):
+            break
+        if current.has_attr("hidden") or str(current.get("aria-hidden") or "").lower() == "true":
+            return True
+        style = str(current.get("style") or "").replace(" ", "").lower()
+        if "display:none" in style or "visibility:hidden" in style or "left:-" in style:
+            return True
+        current = current.parent
+    return False
+
+
+def _job_key(link) -> str:
+    href = link.get("href") or ""
+    from_href = clean((parse_qs(urlparse(href).query).get("jk") or [""])[0])
+    return from_href or clean(link.get("data-jk"))
 
 
 def cards_from_html(html: str) -> list[dict]:
@@ -81,10 +123,10 @@ def cards_from_html(html: str) -> list[dict]:
     seen: set[str] = set()
     for node in soup.select("div.job_seen_beacon"):
         link = node.select_one("a.jcs-JobTitle")
-        if link is None:
+        if link is None or _hidden(link) or _hidden(node):
             continue
-        job_key = clean(link.get("data-jk"))
-        if not job_key or job_key in seen:
+        job_key = _job_key(link)
+        if not job_key or job_key in seen or _trap_key(job_key):
             continue
         seen.add(job_key)
         company = node.select_one('[data-testid="company-name"]')
@@ -174,6 +216,7 @@ def detail_from_html(html: str, page_url: str = "") -> dict:
                 if clean(address.get(key))
             )
     title = clean(posting.get("title"))
+    facts = posting_facts(posting, text)
     return {
         "title": title,
         "company": company,
@@ -185,6 +228,10 @@ def detail_from_html(html: str, page_url: str = "") -> dict:
         "about": about,
         "description": text,
         "apply": apply_url_from_html(html, page_url),
+        "openings": facts["openings"],
+        "applicants": facts["applicants"],
+        "posted_by": facts["posted_by"] or poster_from_html(html),
+        "email": facts["email"],
     }
 
 
@@ -199,6 +246,7 @@ class Indeed(SidecarConnector):
         searches = selected or TECH_QUERIES
         window = min(15, int(posted_within_days or 15))
         seen: set[str] = set()
+        self._detail_blocked = False
         for remote in (False, True):
             for search in searches:
                 if cancelled():
@@ -209,13 +257,15 @@ class Indeed(SidecarConnector):
                     url = search_url(search, page * PAGE_SIZE, remote=remote, fromage=window)
                     try:
                         response = requests.get(url, headers=HEADERS, timeout=30)
-                        response.raise_for_status()
                     except requests.RequestException as exc:
                         self.warnings.append(f"Indeed skipped {search}: {exc}")
                         break
-                    if _blocked(response.text):
-                        self.warnings.append("Indeed did not return the job list")
+                    if _blocked(response.text, response.status_code):
+                        self._note_block()
                         return
+                    if response.status_code >= 400:
+                        self.warnings.append(f"Indeed skipped {search}: HTTP {response.status_code}")
+                        break
                     cards = cards_from_html(response.text)
                     fresh = [card for card in cards if card["url"] not in seen]
                     if not fresh:
@@ -228,9 +278,13 @@ class Indeed(SidecarConnector):
                             continue
                         if not keeps_india_hybrid_or_remote(location):
                             continue
-                        if pause(0.3):
-                            return
-                        detail = self._read_detail(card["url"])
+                        detail = {}
+                        if not self._detail_blocked:
+                            if pause(0.3):
+                                return
+                            detail = self._read_detail(card["url"])
+                        if detail is None:
+                            continue
                         for key, value in detail.items():
                             if value:
                                 card[key] = value
@@ -239,15 +293,25 @@ class Indeed(SidecarConnector):
                             continue
                         yield card
 
-    def _read_detail(self, url: str) -> dict:
+    def _note_block(self) -> None:
+        self._detail_blocked = True
+        if BLOCKED_NOTE not in self.warnings:
+            self.warnings.append(BLOCKED_NOTE)
+
+    def _read_detail(self, url: str) -> dict | None:
+        """Job page details. None means the job is gone; {} keeps the card without them."""
         try:
             response = requests.get(url, headers=HEADERS, timeout=30)
-            response.raise_for_status()
         except requests.RequestException as exc:
             self.warnings.append(f"Indeed detail skipped: {exc}")
             return {}
-        if _blocked(response.text):
-            self.warnings.append("Indeed did not return the job description")
+        if response.status_code == 404:
+            return None
+        if _blocked(response.text, response.status_code):
+            self._note_block()
+            return {}
+        if response.status_code >= 400:
+            self.warnings.append(f"Indeed detail skipped: HTTP {response.status_code}")
             return {}
         return detail_from_html(response.text, url)
 
@@ -265,4 +329,8 @@ class Indeed(SidecarConnector):
             about_company=item.get("about") or "",
             job_description=item.get("description") or "",
             apply_url=item.get("apply") or "",
+            openings=item.get("openings") or "",
+            applicants=item.get("applicants") or "",
+            posted_by=item.get("posted_by") or "",
+            poster_email=item.get("email") or "",
         )

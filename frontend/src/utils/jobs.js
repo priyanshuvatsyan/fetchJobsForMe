@@ -23,8 +23,33 @@ export const SORT_OPTIONS = [
 
 const WORK_MODES = ['remote', 'hybrid', 'on-site', 'onsite', 'in-office']
 
+const POSTED_BY = /(?:posted by|job poster|recruiter|hiring manager)\s*[:\-]?\s*([A-Z][A-Za-z .'-]{1,80})/
+const LABELED_EMAIL = /(?:e-?mail|contact)\s*[:\-]\s*([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/i
+const OPENINGS = /(?:openings?|vacancies)\s*[:\-]?\s*(\d+\+?)|(\d+\+?)\s+(?:openings?|vacancies)\b/i
+const APPLICANTS = /(?:applicants?|applications?)\s*[:\-]?\s*(\d+\+?)|(\d+\+?)\s+applicants?\b/i
+
+function publishedFacts(text) {
+  const source = text || ''
+  const posted = source.match(POSTED_BY)
+  const labeled = source.match(LABELED_EMAIL)
+  const mailto = source.match(/mailto:([^"'\s>]+)/i)
+  const openings = source.match(OPENINGS)
+  const applicants = source.match(APPLICANTS)
+  const email = (labeled?.[1] || mailto?.[1] || '').replace(/[.,;:()<>]+$/, '')
+  const skip = /noreply|no-reply|privacy@|support@|help@|example\.com/i
+  return {
+    postedBy: (posted?.[1] || '').trim().replace(/[.,;]+$/, ''),
+    posterEmail: email && !skip.test(email) ? email : '',
+    openings: openings?.[1] || openings?.[2] || '',
+    applicants: applicants?.[1] || applicants?.[2] || '',
+  }
+}
+
 export function normalizeJob(record, index = 0) {
   const description = record.description || {}
+  const facts = publishedFacts(
+    `${description['about company'] || ''}\n${description['job description'] || ''}`,
+  )
   return {
     id: record.link || `${record.company}-${record.role}-${index}`,
     portal: record.portal || '',
@@ -42,8 +67,10 @@ export function normalizeJob(record, index = 0) {
     location: record.location || '',
     aboutCompany: description['about company'] || '',
     jobDescription: description['job description'] || '',
-    openings: description.openings || '',
-    applicants: description.applicants || '',
+    openings: description.openings || facts.openings,
+    applicants: description.applicants || facts.applicants,
+    postedBy: description['posted by'] || facts.postedBy,
+    posterEmail: description.email || facts.posterEmail,
     link: record.link || '',
     apply: record.apply || record.link || '',
   }
@@ -66,6 +93,8 @@ export function toRecord(job) {
       'job description': job.jobDescription,
       ...(job.openings ? { openings: job.openings } : {}),
       ...(job.applicants ? { applicants: job.applicants } : {}),
+      ...(job.postedBy ? { 'posted by': job.postedBy } : {}),
+      ...(job.posterEmail ? { email: job.posterEmail } : {}),
     },
     link: job.link,
     apply: job.apply || job.link,

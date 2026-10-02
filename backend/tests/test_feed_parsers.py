@@ -352,6 +352,62 @@ B.Tech Computer Science, Example University
             server.RESUME_DIR = original_resume
 
 
+    def test_unstop_keeps_structure_and_fresher_eligibility(self):
+        from Server.api import split_description
+        from connectors.Unstop.Unstop import additional_information, experience_text
+
+        html = (
+            "<p><strong>About the Company</strong></p>\n<p>TipTap is a D2C brand.</p>\n"
+            "<p><strong>What We&rsquo;re Looking For:</strong></p>\n<p>A creator.</p>\n"
+            "<p><strong>What You&rsquo;ll Do:</strong></p>\n<ul><li>Shoot reels.</li><li>Edit videos.</li></ul>"
+        )
+        about, role = split_description(html)
+        self.assertIn("TipTap is a D2C brand.", about)
+        self.assertIn("\n- Shoot reels.\n- Edit videos.", role)
+        item = {
+            "filters": [
+                {"type": "eligible", "name": "Fresher"},
+                {"type": "eligible", "name": "Experienced Professionals"},
+            ],
+            "jobDetail": {"type": "in_office", "timing": "full_time"},
+        }
+        experience = experience_text({"min_experience": None}, "Content Creator", "", item)
+        self.assertEqual(experience, "Fresher")
+        extra = additional_information(item, experience)
+        self.assertIn("Job Type: In Office", extra)
+        self.assertIn("Eligibility: Fresher, Experienced Professionals", extra)
+
+    def test_posting_facts_keep_only_published_contact_and_counts(self):
+        from Server.api import Job, posting_facts
+        from Server.feeds import job_record
+
+        facts = posting_facts(
+            {
+                "totalJobOpenings": 3,
+                "applicationContact": {"name": "Ada Lovelace", "email": "ada@analytical.dev"},
+                "hiringOrganization": {"name": "Acme"},
+            },
+            "Applicants: 40+",
+        )
+        self.assertEqual(facts["posted_by"], "Ada Lovelace")
+        self.assertEqual(facts["email"], "ada@analytical.dev")
+        self.assertEqual(facts["openings"], "3")
+        self.assertEqual(facts["applicants"], "40+")
+        self.assertEqual(posting_facts({}, "Build APIs with Python.")["email"], "")
+        self.assertEqual(posting_facts({"hiringOrganization": {"name": "Acme"}}, "")["posted_by"], "")
+        record = job_record(Job(
+            source="Remotive",
+            title="Software Engineer",
+            company="Acme",
+            location="Remote",
+            url="https://example.com/job",
+            job_description="Posted by: Grace Hopper\nEmail: grace@hopper.dev\n2 openings",
+        ), "remotive")
+        self.assertEqual(record["description"]["posted by"], "Grace Hopper")
+        self.assertEqual(record["description"]["email"], "grace@hopper.dev")
+        self.assertEqual(record["description"]["openings"], "2")
+        self.assertNotIn("applicants", record["description"])
+
     def test_apply_link_falls_back_to_job_url(self):
         from Server.api import Job, apply_url_from_html
         from Server.feeds import job_record
@@ -406,6 +462,34 @@ B.Tech Computer Science, Example University
         self.assertEqual(card["location"], "Hybrid work in Bengaluru, Karnataka")
         self.assertEqual(card["salary"], "₹10,00,000 a year")
         self.assertEqual(card["url"], "https://in.indeed.com/viewjob?jk=abc123")
+        traps = cards_from_html("""
+        <div class="job_seen_beacon" style="display:none">
+          <a class="jcs-JobTitle" data-jk="fedcba9876543210">Software Engineer</a>
+        </div>
+        <div class="job_seen_beacon">
+          <a class="jcs-JobTitle" data-jk="789abcdef0123456" href="/viewjob?jk=789abcdef0123456">Software Engineer</a>
+        </div>
+        <div class="job_seen_beacon">
+          <a class="jcs-JobTitle" data-jk="ignored" href="/rc/clk?jk=a1b2c3d4e5f60789">Software Engineer</a>
+        </div>
+        """)
+        self.assertEqual(
+            [card["url"] for card in traps],
+            ["https://in.indeed.com/viewjob?jk=a1b2c3d4e5f60789"],
+        )
+        from unittest import mock
+        from connectors.Indeed.Indeed import BLOCKED_NOTE, Indeed
+
+        connector = Indeed()
+        connector.warnings = []
+        connector._detail_blocked = False
+        challenge = mock.Mock(status_code=403, text='<div id="cf-box-container"></div>')
+        with mock.patch("connectors.Indeed.Indeed.requests.get", return_value=challenge) as get:
+            self.assertEqual(connector._read_detail("https://in.indeed.com/viewjob?jk=1"), {})
+            self.assertEqual(connector._read_detail("https://in.indeed.com/viewjob?jk=2"), {})
+        self.assertTrue(connector._detail_blocked)
+        self.assertEqual(connector.warnings, [BLOCKED_NOTE])
+        self.assertEqual(get.call_count, 2)
         self.assertTrue(is_tech_role(card["title"]))
         self.assertTrue(keeps_india_hybrid_or_remote(card["location"]))
         self.assertIn("l=India", search_url("software engineer", 0, remote=False, fromage=15))
@@ -532,6 +616,43 @@ B.Tech Computer Science, Example University
         self.assertNotIn("Beware of imposters", plain["description"])
         self.assertNotIn("Connect with us", plain["description"])
         self.assertNotIn("Apply on the go", plain["description"])
+        bold = detail_from_html("""
+        <section class="styles_job-desc-container__txpYf">
+          <div><h2>Job description</h2></div>
+          <div>
+            <div>
+              <p>We are seeking an experienced <strong>MRO Engineers</strong> with strong expertise in <strong>aerospace maintenance</strong>.</p>
+              <br>
+              <p><strong>Key Responsibilities</strong></p>
+              <ul>
+                <li>Investigate <strong>service damages</strong> on <strong>aero engine components</strong> and determine <strong>root causes</strong>.</li>
+              </ul>
+            </div>
+            <div class="styles_other-details__oEN4O">
+              <div><label>Role: </label><span><a>Other</a></span></div>
+              <div><label>Industry Type: </label><span>IT Services &amp; Consulting</span></div>
+            </div>
+            <div>
+              <div>Education</div>
+              <div><label>UG: </label><span>B.Tech / B.E. in Mechanical Engineering</span></div>
+            </div>
+          </div>
+          <div><div>Key Skills</div><div>Skills highlighted with preferred keyskills</div></div>
+        </section>
+        """)
+        self.assertIn(
+            "We are seeking an experienced MRO Engineers with strong expertise in aerospace maintenance.",
+            bold["description"],
+        )
+        self.assertIn("Key Responsibilities", bold["description"])
+        self.assertIn(
+            "- Investigate service damages on aero engine components and determine root causes.",
+            bold["description"],
+        )
+        self.assertNotIn("- service damages", bold["description"])
+        self.assertIn("Role: Other", bold["description"])
+        self.assertIn("Industry Type: IT Services & Consulting", bold["description"])
+        self.assertIn("UG: B.Tech / B.E. in Mechanical Engineering", bold["description"])
 
     def test_user_search_preferences_filter_jobs(self):
         import tempfile

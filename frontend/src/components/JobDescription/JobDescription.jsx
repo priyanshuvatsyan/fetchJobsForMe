@@ -8,6 +8,15 @@ function toBlocks(text) {
     .filter(Boolean)
 }
 
+const isBullet = (line) => line.startsWith('-')
+
+/** Short label lines such as "Responsibilities" or "What You'll Do:" that open a block. */
+function isHeading(line, next) {
+  if (isBullet(line) || line.length > 70 || /[.,;]$/.test(line)) return false
+  if (line.endsWith(':')) return true
+  return Boolean(next) && (isBullet(next) || next.length > line.length * 2)
+}
+
 const Section = ({ title, text }) => {
   const blocks = toBlocks(text)
   if (!blocks.length) return null
@@ -16,10 +25,14 @@ const Section = ({ title, text }) => {
     <section className="job-description-section">
       <h4 className="job-description-title">{title}</h4>
       {blocks.map((line, index) =>
-        line.startsWith('-') ? (
+        isBullet(line) ? (
           <p className="job-description-bullet" key={index}>
             <span aria-hidden="true">•</span>
             {line.replace(/^-\s*/, '')}
+          </p>
+        ) : isHeading(line, blocks[index + 1]) ? (
+          <p className="job-description-heading" key={index}>
+            {line}
           </p>
         ) : (
           <p className="job-description-text" key={index}>
@@ -49,10 +62,29 @@ const Stats = ({ openings, applicants }) => {
   )
 }
 
-const JobDescription = ({ aboutCompany, jobDescription, openings = '', applicants = '' }) => (
+const Poster = ({ name, email }) => {
+  if (!name && !email) return null
+  return (
+    <section className="job-description-section">
+      <h4 className="job-description-title">Posted by</h4>
+      {name ? <p className="job-description-text">{name}</p> : null}
+      {email ? <p className="job-description-text">{email}</p> : null}
+    </section>
+  )
+}
+
+const JobDescription = ({
+  aboutCompany,
+  jobDescription,
+  openings = '',
+  applicants = '',
+  postedBy = '',
+  posterEmail = '',
+}) => (
   <div className="job-description">
     <Stats openings={openings} applicants={applicants} />
     <Section title="About company" text={aboutCompany} />
+    <Poster name={postedBy} email={posterEmail} />
     <Section title="Job description" text={jobDescription} />
   </div>
 )

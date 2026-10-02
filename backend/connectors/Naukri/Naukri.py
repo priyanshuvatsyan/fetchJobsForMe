@@ -23,6 +23,8 @@ from Server.api import (
     Job,
     apply_url_from_html,
     clean,
+    poster_from_html,
+    posting_facts,
     format_skills,
     is_tech_role,
     keeps_india_hybrid_or_remote,
@@ -228,6 +230,24 @@ def _label_line(node) -> str:
     return ""
 
 
+def _flow_text(element) -> str:
+    """Text of one block. Inline tags such as strong stay inside the sentence."""
+    chunks: list[str] = []
+    for child in getattr(element, "children", []):
+        name = getattr(child, "name", None)
+        if name is None:
+            chunks.append(str(child))
+        elif name == "br":
+            chunks.append("\n")
+        elif name in {"ul", "ol", "p", "div", "li", "h2", "h3", "h4", "h5", "table", "section"}:
+            continue
+        else:
+            chunks.append(child.get_text(" ", strip=False))
+    text = re.sub(r"[ \t]*\n[ \t]*", "\n", "".join(chunks))
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return "\n".join(clean(line) for line in text.splitlines() if clean(line))
+
+
 def _section_lines(heading) -> list[str]:
     """Job-description text only. Page chrome after the posting is left out."""
     lines = []
@@ -261,7 +281,7 @@ def _section_lines(heading) -> list[str]:
                 if not take(labeled):
                     break
                 continue
-        if not take(element.get_text("\n", strip=True), bullet=name == "li"):
+        if not take(_flow_text(element), bullet=name == "li"):
             break
     return list(dict.fromkeys(lines))
 
@@ -290,6 +310,7 @@ def detail_from_html(html: str, page_url: str = "") -> dict:
                 about = f"Address: {address}" if address else ""
             else:
                 about = body
+    facts = posting_facts({}, description)
     skills = []
     skill_heading = _heading(soup, "key skills")
     if skill_heading is not None:
@@ -301,10 +322,12 @@ def detail_from_html(html: str, page_url: str = "") -> dict:
     return {
         "description": description,
         "about": about,
-        "openings": _stat(soup, "openings"),
-        "applicants": _stat(soup, "applicants"),
+        "openings": _stat(soup, "openings") or facts["openings"],
+        "applicants": _stat(soup, "applicants") or facts["applicants"],
         "skills": list(dict.fromkeys(skills)),
         "apply": apply_url_from_html(html, page_url),
+        "posted_by": facts["posted_by"] or poster_from_html(html),
+        "email": facts["email"],
     }
 
 
@@ -397,7 +420,8 @@ class Naukri(SidecarConnector):
             try:
                 asyncio.run(self._browse(found, query, posted_within_days))
             except Exception as exc:
-                errors.append(exc)
+                if not cancelled():
+                    errors.append(exc)
             finally:
                 found.put(None)
 
@@ -451,7 +475,8 @@ class Naukri(SidecarConnector):
             except RuntimeError as exc:
                 if "denied" in str(exc).casefold():
                     raise
-                self.warnings.append(str(exc))
+                if not cancelled():
+                    self.warnings.append(str(exc))
                 return
             cards = cards_from_html(html)
             if not cards:
@@ -498,10 +523,14 @@ class Naukri(SidecarConnector):
                 pass
             detail = detail_from_html(await tab.content(), card.get("url") or "")
         except Exception as exc:
-            self.warnings.append(f"detail skipped: {exc}")
+            if not cancelled():
+                self.warnings.append(f"detail skipped: {exc}")
             return
         finally:
-            await tab.close()
+            try:
+                await tab.close()
+            except Exception:
+                pass
         if detail.get("description"):
             card["description"] = detail["description"]
         if detail.get("about"):
@@ -512,6 +541,10 @@ class Naukri(SidecarConnector):
             card["skills"] = detail["skills"]
         if detail.get("apply"):
             card["apply"] = detail["apply"]
+        if detail.get("posted_by"):
+            card["posted_by"] = detail["posted_by"]
+        if detail.get("email"):
+            card["email"] = detail["email"]
 
     async def _open(self, page, url: str) -> str:
         try:
@@ -557,4 +590,6 @@ class Naukri(SidecarConnector):
             openings=item.get("openings") or "",
             applicants=item.get("applicants") or "",
             apply_url=item.get("apply") or "",
+            posted_by=item.get("posted_by") or "",
+            poster_email=item.get("email") or "",
         )

@@ -63,7 +63,15 @@ def event(portal: str, level: str, message: str) -> None:
     _LOGGER.log(numeric, "[%s] %s", portal or "-", message)
 
 
-from Server.api import POSTED_WINDOW_DAYS, Job, clean, is_tech_role, keeps_india_hybrid_or_remote, within_days
+from Server.api import (
+    POSTED_WINDOW_DAYS,
+    Job,
+    apply_posting_facts,
+    clean,
+    is_tech_role,
+    keeps_india_hybrid_or_remote,
+    within_days,
+)
 from Server.control import arm, cancel, held
 from Server.feeds import FeedCoordinator
 from connectors.Adzuna import Adzuna
@@ -472,6 +480,7 @@ def sort_jobs(jobs: list[Job], specs: list[tuple[str, bool]]) -> list[Job]:
 
 
 def job_record(job: Job, include_portal: bool, portal_key: str = "") -> dict:
+    job = apply_posting_facts(job)
     record = {
         "company": job.company,
         "role": job.title,
@@ -483,6 +492,8 @@ def job_record(job: Job, include_portal: bool, portal_key: str = "") -> dict:
         "description": {
             "about company": job.about_company,
             "job description": job.job_description,
+            **({"posted by": job.posted_by} if job.posted_by else {}),
+            **({"email": job.poster_email} if job.poster_email else {}),
             **({"openings": job.openings} if job.openings else {}),
             **({"applicants": job.applicants} if job.applicants else {}),
         },
@@ -672,7 +683,7 @@ def _saved_record(record: dict) -> dict:
         "about company": str(description.get("about company") or ""),
         "job description": str(description.get("job description") or ""),
     }
-    for field in ("openings", "applicants"):
+    for field in ("openings", "applicants", "posted by", "email"):
         value = str(description.get(field) or "").strip()
         if value:
             clean["description"][field] = value
