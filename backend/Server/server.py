@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from xml.etree import ElementTree
+import os
 
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
@@ -78,6 +79,7 @@ from connectors.FourDayWeek import FourDayWeek
 from connectors.Himalayas import Himalayas
 from connectors.Instahyre import Instahyre
 from connectors.Jobicy import Jobicy
+from connectors.Indeed import Indeed
 from connectors.Naukri import Naukri
 from connectors.Shine import Shine
 from connectors.TheMuse import TheMuse
@@ -98,6 +100,7 @@ CONNECTORS = [
     LinkedIn,
     Unstop,
     Shine,
+    Indeed,
     Naukri,
     Instahyre,
     Himalayas,
@@ -138,6 +141,7 @@ CREDITS = {
     "themuse": "Jobs sourced from The Muse — https://www.themuse.com",
     "fourdayweek": "Jobs sourced from 4 Day Week — https://4dayweek.io",
     "weworkremotely": "Jobs sourced from We Work Remotely — https://weworkremotely.com",
+    "indeed": "Jobs sourced from Indeed — https://in.indeed.com",
     "naukri": "Jobs sourced from Naukri — https://www.naukri.com",
 }
 SIDECAR_SOURCES = [cls for cls in CONNECTORS if getattr(cls, "persist", "") == "sidecar"]
@@ -179,7 +183,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="start the jobs API (this is also what happens when no search flags are given)",
     )
-    parser.add_argument("--port", type=int, default=8001, help="port for the jobs API")
+    parser.add_argument(
+        "--host",
+        default=os.getenv("HOST", "0.0.0.0"),
+        help="interface for the jobs API",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("PORT", "8001")),
+        help="port for the jobs API",
+    )
     return parser
 
 
@@ -473,6 +487,7 @@ def job_record(job: Job, include_portal: bool, portal_key: str = "") -> dict:
             **({"applicants": job.applicants} if job.applicants else {}),
         },
         "link": job.url,
+        "apply": job.apply_url or job.url,
     }
     if include_portal:
         record = {"portal": job.source, "portalKey": portal_key, **record}
@@ -539,7 +554,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--limit must be at least 1")
 
     if args.serve or not wants_terminal_output(given):
-        serve(args.port, args.country)
+        serve(args.host, args.port, args.country)
         return
 
     sources = selected_sources(args.source)
@@ -627,7 +642,7 @@ SAVED_FILE = JOBS_FILE.parent / "saved_jobs.json"
 _saved_lock = threading.Lock()
 _SAVED_FIELDS = (
     "portal", "portalKey", "company", "role", "experience",
-    "skill", "salary", "added on", "location", "link",
+    "skill", "salary", "added on", "location", "link", "apply",
 )
 
 
@@ -650,6 +665,8 @@ def _saved_record(record: dict) -> dict:
         raise ValueError("job needs an http(s) link")
     clean = {field: str(record.get(field) or "") for field in _SAVED_FIELDS}
     clean["link"] = link
+    apply = str(record.get("apply") or "").strip()
+    clean["apply"] = apply if apply.startswith(("http://", "https://")) else link
     description = record.get("description") if isinstance(record.get("description"), dict) else {}
     clean["description"] = {
         "about company": str(description.get("about company") or ""),
@@ -1306,6 +1323,9 @@ def _reset_progress() -> None:
 def stop_fetches() -> dict:
     """Stop every portal and keep the jobs already written to JSON."""
     cancel()
+    from connectors.Naukri.Naukri import close_naukri_browser
+
+    close_naukri_browser()
     FEED_COORDINATOR.stop()
     with _jobs_lock:
         _progress["stopped"] = True
@@ -1582,13 +1602,14 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def serve(port: int, country: str) -> None:
+def serve(host: str, port: int, country: str) -> None:
     enable()
     handler = type("JobsApiHandler", (JobsApiHandler,), {"country": country})
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
-    event("api", "info", f"listening on http://127.0.0.1:{port}")
-    print(f"fetchJobsForMe API on http://127.0.0.1:{port}")
-    print(f"  GET http://127.0.0.1:{port}/api/jobs?source=all&query=engineer")
+    httpd = ThreadingHTTPServer((host, port), handler)
+    display_host = "127.0.0.1" if host == "0.0.0.0" else host
+    event("api", "info", f"listening on http://{display_host}:{port}")
+    print(f"fetchJobsForMe API on http://{display_host}:{port}")
+    print(f"  GET http://{display_host}:{port}/api/jobs?source=all&query=engineer")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

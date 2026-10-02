@@ -45,6 +45,7 @@ export function normalizeJob(record, index = 0) {
     openings: description.openings || '',
     applicants: description.applicants || '',
     link: record.link || '',
+    apply: record.apply || record.link || '',
   }
 }
 
@@ -67,6 +68,7 @@ export function toRecord(job) {
       ...(job.applicants ? { applicants: job.applicants } : {}),
     },
     link: job.link,
+    apply: job.apply || job.link,
   }
 }
 

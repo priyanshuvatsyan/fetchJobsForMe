@@ -19,7 +19,16 @@ from bs4 import BeautifulSoup
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
-from Server.api import Job, clean, format_skills, is_tech_role, keeps_india_hybrid_or_remote, within_days
+from Server.api import (
+    Job,
+    apply_url_from_html,
+    clean,
+    format_skills,
+    is_tech_role,
+    keeps_india_hybrid_or_remote,
+    within_days,
+)
+from Server.control import cancelled
 from Server.feeds import SidecarConnector
 
 BASE_URL = "https://www.naukri.com"
@@ -161,7 +170,48 @@ def _stat(soup: BeautifulSoup, name: str) -> str:
     return ""
 
 
-_STOP_HEADINGS = {"key skills", "about company", "similar jobs", "beware of imposters!"}
+_STOP_PREFIXES = (
+    "key skills",
+    "skills highlighted",
+    "about company",
+    "similar jobs",
+    "beware of imposters",
+    "report this job",
+    "inappropriate content",
+    "incomplete information about job",
+    "fake job",
+    "duplicate of another job",
+    "incorrect email",
+    "phone number not contactable",
+    "connect with us",
+    "apply on the go",
+    "register to unlock",
+    "hiring for one of these companies",
+    "ieil has taken",
+    "naukri.com does not promise",
+    "security guidelines",
+    "privacy policy",
+    "fraud alert",
+    "trust & safety",
+    "terms & conditions",
+)
+
+
+def _own_text(element) -> str:
+    """Heading label only, not the text of everything nested inside it."""
+    direct = clean(" ".join(
+        str(child) for child in getattr(element, "children", []) if getattr(child, "name", None) is None
+    ))
+    if direct:
+        return direct
+    return clean(element.find(string=True) or "")
+
+
+def _is_stop(text: str) -> bool:
+    folded = clean(text).casefold().strip(" :•-")
+    if not folded:
+        return False
+    return any(folded == phrase or folded.startswith(phrase) for phrase in _STOP_PREFIXES)
 
 
 def _label_line(node) -> str:
@@ -179,40 +229,44 @@ def _label_line(node) -> str:
 
 
 def _section_lines(heading) -> list[str]:
-    """Text after the Job description heading, including divs that are not paragraphs or lists."""
+    """Job-description text only. Page chrome after the posting is left out."""
     lines = []
+
+    def take(text: str, *, bullet: bool = False) -> bool:
+        for raw in text.splitlines():
+            line = clean(raw)
+            if not line or line.casefold() == "job description":
+                continue
+            if _is_stop(line):
+                return False
+            lines.append(f"- {line}" if bullet else line)
+        return True
+
     for element in heading.find_all_next(["h2", "h3", "h4", "h5", "p", "li", "div"]):
         name = element.name
-        title = clean(element.get_text(" ", strip=True))
-        folded = title.casefold()
-        if name in {"h2", "h3", "h4"} and folded in _STOP_HEADINGS:
-            break
         if name in {"h2", "h3", "h4", "h5"}:
-            if title and folded != "job description":
-                lines.append(title)
-            continue
-        if name == "li":
-            if title:
-                lines.append(f"- {title}")
+            label = _own_text(element) or clean(element.get_text(" ", strip=True))
+            if _is_stop(label):
+                break
+            if label and label.casefold() != "job description" and not take(label):
+                break
             continue
         if name == "div" and element.find(["div", "p", "li", "ul", "ol", "h2", "h3", "h4", "h5"]):
+            if _is_stop(_own_text(element)):
+                break
             continue
         if name == "div":
             labeled = _label_line(element)
             if labeled:
-                lines.append(labeled)
+                if not take(labeled):
+                    break
                 continue
-        for line in element.get_text("\n", strip=True).splitlines():
-            line = clean(line)
-            if not line or line.casefold() == "job description":
-                continue
-            if "preferred keyskills" in line.casefold():
-                continue
-            lines.append(line)
+        if not take(element.get_text("\n", strip=True), bullet=name == "li"):
+            break
     return list(dict.fromkeys(lines))
 
 
-def detail_from_html(html: str) -> dict:
+def detail_from_html(html: str, page_url: str = "") -> dict:
     """Full description, openings, and applicants from a rendered job page."""
     soup = BeautifulSoup(html or "", "html.parser")
     description = ""
@@ -250,6 +304,7 @@ def detail_from_html(html: str) -> dict:
         "openings": _stat(soup, "openings"),
         "applicants": _stat(soup, "applicants"),
         "skills": list(dict.fromkeys(skills)),
+        "apply": apply_url_from_html(html, page_url),
     }
 
 
@@ -298,6 +353,30 @@ def _blocked(html: str) -> bool:
     return any(phrase in text for phrase in _BLOCKED)
 
 
+_browser_lock = threading.Lock()
+_live_browser = {"loop": None, "browser": None}
+
+
+def close_naukri_browser() -> None:
+    """Close the visible Naukri Chrome window as soon as a fetch is stopped."""
+    with _browser_lock:
+        loop = _live_browser.get("loop")
+        browser = _live_browser.get("browser")
+    if loop is None or browser is None or loop.is_closed():
+        return
+
+    async def _close() -> None:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+    try:
+        asyncio.run_coroutine_threadsafe(_close(), loop).result(timeout=8)
+    except Exception:
+        pass
+
+
 async def _launch(playwright):
     """Visible installed Chrome. Headless is rejected by Naukri before any cards exist."""
     try:
@@ -338,18 +417,34 @@ class Naukri(SidecarConnector):
         searches = selected or TECH_QUERIES
         async with async_playwright() as playwright:
             browser = await _launch(playwright)
+            with _browser_lock:
+                _live_browser["loop"] = asyncio.get_running_loop()
+                _live_browser["browser"] = browser
             context = await browser.new_context(locale="en-IN", viewport={"width": 1440, "height": 900})
             page = await context.new_page()
             page.set_default_timeout(15000)
             try:
                 for remote in (False, True):
+                    if cancelled():
+                        return
                     for search in searches:
+                        if cancelled():
+                            return
                         await self._pages(context, page, found, search, remote, posted_within_days)
             finally:
-                await browser.close()
+                with _browser_lock:
+                    if _live_browser.get("browser") is browser:
+                        _live_browser["browser"] = None
+                        _live_browser["loop"] = None
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
     async def _pages(self, context, page, found: Queue, search: str, remote: bool, posted_within_days: int | None) -> None:
         for page_number in range(1, MAX_PAGES + 1):
+            if cancelled():
+                return
             url = search_url(search, page_number, remote=remote)
             try:
                 html = await self._open(page, url)
@@ -381,6 +476,8 @@ class Naukri(SidecarConnector):
     async def _fill_details(self, context, cards: list[dict]) -> None:
         """Open kept jobs in parallel tabs, read the full posting, then close the tabs."""
         for start in range(0, len(cards), DETAIL_TABS):
+            if cancelled():
+                return
             await asyncio.gather(*(self._read_detail(context, card) for card in cards[start:start + DETAIL_TABS]))
 
     async def _read_detail(self, context, card: dict) -> None:
@@ -399,7 +496,7 @@ class Naukri(SidecarConnector):
                 )
             except PlaywrightTimeoutError:
                 pass
-            detail = detail_from_html(await tab.content())
+            detail = detail_from_html(await tab.content(), card.get("url") or "")
         except Exception as exc:
             self.warnings.append(f"detail skipped: {exc}")
             return
@@ -413,6 +510,8 @@ class Naukri(SidecarConnector):
         card["applicants"] = detail.get("applicants") or ""
         if detail.get("skills"):
             card["skills"] = detail["skills"]
+        if detail.get("apply"):
+            card["apply"] = detail["apply"]
 
     async def _open(self, page, url: str) -> str:
         try:
@@ -457,4 +556,5 @@ class Naukri(SidecarConnector):
             job_description=item.get("description") or "",
             openings=item.get("openings") or "",
             applicants=item.get("applicants") or "",
+            apply_url=item.get("apply") or "",
         )

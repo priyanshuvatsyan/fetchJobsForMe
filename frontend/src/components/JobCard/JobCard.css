@@ -53,6 +53,17 @@
   color: var(--jb-text);
 }
 
+.job-card-role-link,
+.job-card-role-link:hover,
+.job-card-role-link:focus,
+.job-card-role-link:active,
+.job-card-role-link:visited {
+  color: inherit;
+  font: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+
 .job-card-company {
   margin: 2px 0 0;
   font-size: 14px;

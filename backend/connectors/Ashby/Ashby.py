@@ -86,6 +86,7 @@ class Ashby:
                         company=company,
                         location=_location(item),
                         url=clean(item.get("jobUrl") or item.get("applyUrl")),
+                        apply_url=clean(item.get("applyUrl")),
                         posted_at=posted_at,
                         experience=experience,
                         skill=skill,
