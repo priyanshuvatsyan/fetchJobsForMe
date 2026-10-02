@@ -131,6 +131,7 @@ def job_record(job: Job, portal_key: str = "") -> dict:
         "location": job.location,
         "description": _description(job),
         "link": job.url,
+        "apply": job.apply_url or job.url,
     }
 
 
