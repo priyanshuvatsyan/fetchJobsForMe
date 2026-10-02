@@ -103,7 +103,38 @@
 }
 
 .settings-input-wrap input {
-  padding-right: 56px;
+  padding-right: 90px;
+}
+
+.settings-input-buttons {
+  position: absolute;
+  right: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.settings-action-btn {
+  background: transparent;
+  border: none;
+  color: #7e899b;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 4px;
+}
+
+.settings-action-btn:hover {
+  color: #e8ecf3;
+}
+
+.settings-clear-btn {
+  color: #f87171;
+}
+
+.settings-clear-btn:hover {
+  color: #ef4444;
 }
 
 .settings-toggle-visibility {
@@ -155,6 +186,35 @@
 .settings-values dd.font-mono {
   font-family: monospace;
   letter-spacing: 0.5px;
+}
+
+.api-key-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.settings-remove-btn {
+  background: transparent;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  color: #f87171;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.settings-remove-btn:hover {
+  background: rgba(239, 68, 68, 0.1);
+  border-color: #ef4444;
+  color: #ef4444;
+}
+
+.settings-remove-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .settings-rule {

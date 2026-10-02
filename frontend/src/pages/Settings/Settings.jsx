@@ -69,6 +69,16 @@ function SearchPreferences() {
     if (await save(draft)) cancel()
   }
 
+  const handleQuickRemove = async () => {
+    if (window.confirm('Are you sure you want to remove your stored API key?')) {
+      await save({
+        ...preferences,
+        apiKey: '',
+        geminiApiKey: '',
+      })
+    }
+  }
+
   if (status === 'loading') return <p className="settings-muted">Loading preferences…</p>
 
   return (
@@ -98,13 +108,25 @@ function SearchPreferences() {
                     setDraft((value) => ({ ...value, apiKey: event.target.value.trim() }))
                   }
                 />
-                <button
-                  type="button"
-                  className="settings-toggle-visibility"
-                  onClick={() => setShowKey((prev) => !prev)}
-                >
-                  {showKey ? 'Hide' : 'Show'}
-                </button>
+                <div className="settings-input-buttons">
+                  {current.apiKey ? (
+                    <button
+                      type="button"
+                      className="settings-action-btn settings-clear-btn"
+                      onClick={() => setDraft((value) => ({ ...value, apiKey: '' }))}
+                      title="Clear key"
+                    >
+                      Clear
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="settings-action-btn"
+                    onClick={() => setShowKey((prev) => !prev)}
+                  >
+                    {showKey ? 'Hide' : 'Show'}
+                  </button>
+                </div>
               </div>
               <small>Your secret key used for authenticating third-party board fetch queries.</small>
             </label>
@@ -183,9 +205,21 @@ function SearchPreferences() {
         </>
       ) : (
         <dl className="settings-values">
-          <div className="is-wide">
-            <dt>API Key</dt>
-            <dd className="font-mono">{maskApiKey(preferences?.apiKey)}</dd>
+          <div className="is-wide api-key-card">
+            <div>
+              <dt>API Key</dt>
+              <dd className="font-mono">{maskApiKey(preferences?.apiKey)}</dd>
+            </div>
+            {preferences?.apiKey ? (
+              <button
+                type="button"
+                className="settings-remove-btn"
+                onClick={handleQuickRemove}
+                disabled={status === 'saving'}
+              >
+                Remove key
+              </button>
+            ) : null}
           </div>
           <div>
             <dt>Experience</dt>
