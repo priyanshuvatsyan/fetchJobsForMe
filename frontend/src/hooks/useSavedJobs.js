@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { fetchSavedJobs, saveJob, unsaveJob } from '../api/saved'
 
 /**
- * Starred jobs, stored by the API in backend/data/saved_jobs.json.
+ * Starred jobs, stored in Firebase under the signed-in user.
  * Toggling updates the list at once and rolls back if the request fails.
  */
 export function useSavedJobs() {
