@@ -41,16 +41,21 @@ class Shine(SidecarConnector):
     label = "Shine"
 
     def iter_items(self, query: str, posted_within_days: int | None):
-        searches = (query,) if query else TECH_QUERIES
+        selected = tuple(getattr(self, "search_phrases", ()) or ())
+        searches = selected or ((query,) if query else TECH_QUERIES)
         for search in searches:
             for page in range(1, 101):
-                response = requests.get(
-                    API_URL,
-                    params={"q": search, "page": page},
-                    headers=HEADERS,
-                    timeout=30,
-                )
-                response.raise_for_status()
+                try:
+                    response = requests.get(
+                        API_URL,
+                        params={"q": search, "page": page},
+                        headers=HEADERS,
+                        timeout=30,
+                    )
+                    response.raise_for_status()
+                except requests.RequestException as exc:
+                    self.warnings.append(f"Shine skipped {search}: {exc}")
+                    break
                 payload = response.json()
                 items = payload.get("results") or []
                 if not items:

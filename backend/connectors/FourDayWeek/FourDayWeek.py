@@ -16,22 +16,29 @@ class FourDayWeek(SidecarConnector):
     label = "4 Day Week"
 
     def iter_items(self, query: str, posted_within_days: int | None):
-        for page in range(1, 101):
-            params = {
-                "page": page,
-                "limit": 100,
-                "posted_after": posted_within_days or 15,
-                "category": "engineering",
-                "sort": "date",
-            }
-            if query:
-                params["q"] = query
-            response = requests.get(API_URL, params=params, headers=HEADERS, timeout=30)
-            response.raise_for_status()
-            payload = response.json()
-            yield from payload.get("data") or []
-            if not payload.get("has_more"):
-                break
+        selected = tuple(getattr(self, "search_phrases", ()) or ())
+        searches = selected or ((query,) if query else ("",))
+        for search in searches:
+            for page in range(1, 101):
+                params = {
+                    "page": page,
+                    "limit": 100,
+                    "posted_after": posted_within_days or 15,
+                    "category": "engineering",
+                    "sort": "date",
+                }
+                if search:
+                    params["q"] = search
+                try:
+                    response = requests.get(API_URL, params=params, headers=HEADERS, timeout=30)
+                    response.raise_for_status()
+                except requests.RequestException as exc:
+                    self.warnings.append(f"4 Day Week skipped {search or 'the engineering feed'}: {exc}")
+                    break
+                payload = response.json()
+                yield from payload.get("data") or []
+                if not payload.get("has_more"):
+                    break
 
     def parse_item(self, item: dict) -> Job:
         body = item.get("description") or ""

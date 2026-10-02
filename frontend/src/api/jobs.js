@@ -1,5 +1,6 @@
 import { getJson } from './client'
 import { normalizeJob } from '../utils/jobs'
+import { auth } from '../firebase'
 
 export async function stopJobs(signal) {
   const payload = await getJson('/api/jobs/stop', { signal })
@@ -15,7 +16,10 @@ export async function stopJobs(signal) {
 
 export async function fetchJobs({ refresh = false } = {}, signal) {
   const payload = await getJson('/api/jobs', {
-    params: { refresh: refresh ? '1' : '' },
+    params: {
+      refresh: refresh ? '1' : '',
+      uid: auth.currentUser?.uid || '',
+    },
     signal,
   })
   return {
