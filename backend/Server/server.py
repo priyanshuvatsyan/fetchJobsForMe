@@ -27,11 +27,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from xml.etree import ElementTree
 import os
-from Server.gemini_service import get_user_gemini_client
+
+
 
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
+
+from Server.gemini_service import get_user_gemini_client
 
 _LOGGER = logging.getLogger("fetchjobs")
 _LOG_ENABLED = False
