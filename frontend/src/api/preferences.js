@@ -37,7 +37,7 @@ export async function savePreferences(preferences, signal) {
     roles: preferences?.roles || [],
     experience: preferences?.experience ?? null,
     posted: preferences?.posted || 'all',
-    apiKey: resolvedApiKey,
+    geminiApiKey: resolvedApiKey,
     updatedAt: serverTimestamp(),
   }
 
