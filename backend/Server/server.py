@@ -27,6 +27,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from xml.etree import ElementTree
 import os
+from firebase import get_firestore_client
+
 
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
@@ -850,8 +852,7 @@ def apply_preferences(payload: dict, preferences: dict) -> dict:
 
 # Candidate profile and resume. The profile is deliberately provider-neutral so
 # recommendations, applications, and future agents can all consume one schema.
-PROFILE_FILE = JOBS_FILE.parent / "profile.json"
-RESUME_DIR = JOBS_FILE.parent / "resume"
+
 MAX_RESUME_BYTES = 8 * 1024 * 1024
 _profile_lock = threading.Lock()
 _PROFILE_TEXT_FIELDS = (
@@ -898,178 +899,627 @@ def _profile_completion(profile: dict) -> int:
     complete = sum(bool(profile.get(field)) for field in important)
     return round(complete * 100 / len(important))
 
+def _profile_document(uid: str):
+    uid = str(uid or "").strip()
 
-def read_profile() -> dict:
+    if not uid:
+        raise ValueError("authenticated user UID is required")
+
+    return (
+        get_firestore_client()
+        .collection("users")
+        .document(uid)
+        .collection("jobProfile")
+        .document("default")
+    )
+
+def read_profile(uid: str) -> dict:
     profile = _empty_profile()
+
     try:
-        payload = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        snapshot = _profile_document(uid).get()
+        payload = snapshot.to_dict() if snapshot.exists else {}
+    except Exception as exc:
+        event(
+            "profile",
+            "error",
+            f"profile read failed uid={uid}: {exc}",
+        )
+        raise ValueError("could not read profile") from exc
+
+    if not isinstance(payload, dict):
         payload = {}
-    if isinstance(payload, dict):
-        for field in _PROFILE_TEXT_FIELDS:
-            if isinstance(payload.get(field), str):
-                profile[field] = payload[field]
-        for field in _PROFILE_LIST_FIELDS:
-            if isinstance(payload.get(field), list):
-                profile[field] = [str(item).strip() for item in payload[field] if str(item).strip()]
-        for field in _PROFILE_BOOL_FIELDS:
-            profile[field] = bool(payload.get(field))
-        if isinstance(payload.get("resume"), dict):
-            profile["resume"] = payload["resume"]
-        profile["updatedAt"] = str(payload.get("updatedAt") or "")
+
+    for field in _PROFILE_TEXT_FIELDS:
+        value = payload.get(field)
+        if isinstance(value, str):
+            profile[field] = value
+
+    for field in _PROFILE_LIST_FIELDS:
+        value = payload.get(field)
+
+        if isinstance(value, list):
+            profile[field] = list(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in value
+                    if str(item).strip()
+                )
+            )[:100]
+
+    for field in _PROFILE_BOOL_FIELDS:
+        profile[field] = bool(payload.get(field, False))
+
+    resume = payload.get("resume")
+
+    if isinstance(resume, dict):
+        profile["resume"] = resume
+
+    profile["updatedAt"] = str(payload.get("updatedAt") or "")
     profile["completion"] = _profile_completion(profile)
+
     return profile
 
-
-def update_profile(changes: dict) -> dict:
+def update_profile(uid: str, changes: dict) -> dict:
     if not isinstance(changes, dict):
         raise ValueError("profile must be an object")
+
+    uid = str(uid or "").strip()
+
+    if not uid:
+        raise ValueError("authenticated user UID is required")
+
     with _profile_lock:
-        profile = read_profile()
+        profile = read_profile(uid)
+
         for field in _PROFILE_TEXT_FIELDS:
             if field in changes:
-                profile[field] = str(changes[field] or "").strip()[:10_000]
+                profile[field] = str(
+                    changes[field] or ""
+                ).strip()[:10_000]
+
         for field in _PROFILE_LIST_FIELDS:
             if field not in changes:
                 continue
+
             value = changes[field]
+
             if not isinstance(value, list):
                 raise ValueError(f"{field} must be a list")
-            profile[field] = list(dict.fromkeys(
-                str(item).strip()[:120] for item in value if str(item).strip()
-            ))[:100]
+
+            profile[field] = list(
+                dict.fromkeys(
+                    str(item).strip()[:120]
+                    for item in value
+                    if str(item).strip()
+                )
+            )[:100]
+
         for field in _PROFILE_BOOL_FIELDS:
             if field in changes:
                 profile[field] = bool(changes[field])
-        profile["updatedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        profile.pop("completion", None)
-        _write_json(PROFILE_FILE, profile)
-    event("profile", "info", "profile updated")
-    return read_profile()
 
+        profile["updatedAt"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        profile.pop("completion", None)
+
+        try:
+            _profile_document(uid).set(profile, merge=True)
+        except Exception as exc:
+            event(
+                "profile",
+                "error",
+                f"profile update failed uid={uid}: {exc}",
+            )
+            raise ValueError("could not update profile") from exc
+
+    event("profile", "info", f"profile updated uid={uid}")
+
+    return read_profile(uid)
 
 def _resume_text(content: bytes, suffix: str) -> str:
+    suffix = suffix.casefold()
+
     if suffix == ".txt":
         return content.decode("utf-8", errors="replace")
+
     if suffix == ".docx":
-        try:
-            with zipfile.ZipFile(io.BytesIO(content)) as archive:
-                xml = archive.read("word/document.xml")
-            root = ElementTree.fromstring(xml)
-        except (KeyError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
-            raise ValueError("invalid DOCX resume") from exc
-        paragraphs = []
-        for paragraph in root.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"):
-            text = "".join(
-                node.text or ""
-                for node in paragraph.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t")
-            ).strip()
-            if text:
-                paragraphs.append(text)
-        return "\n".join(paragraphs)
+        return _docx_resume_text(content)
+
     if suffix == ".pdf":
-        try:
-            from pypdf import PdfReader
-        except ImportError as exc:
-            raise ValueError("PDF parsing requires the pypdf package from backend/requirements.txt") from exc
-        try:
-            reader = PdfReader(io.BytesIO(content), strict=False)
-            if reader.is_encrypted:
-                reader.decrypt("")
-            pages = []
-            for page in reader.pages:
-                pages.append(page.extract_text() or "")
-            text = "\n".join(pages).strip()
-            if not text:
-                raise ValueError("This PDF has no selectable text. Export it as DOCX, or upload a text-based PDF.")
-            return text
-        except ValueError:
-            raise
-        except Exception as exc:
-            event("profile", "error", f"pdf parse failed: {exc}")
-            raise ValueError(
-                "This PDF could not be read. Export it as DOCX, or use a PDF with selectable text."
-            ) from exc
+        return _pdf_resume_text(content)
+
     raise ValueError("resume must be a PDF, DOCX, or TXT file")
 
+def _docx_resume_text(content: bytes) -> str:
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            xml = archive.read("word/document.xml")
 
-def _section(text: str, headings: tuple[str, ...], stops: tuple[str, ...]) -> str:
-    lines = [line.strip() for line in text.splitlines()]
-    start = next(
-        (index + 1 for index, line in enumerate(lines) if line.casefold().rstrip(":") in headings),
-        None,
+        root = ElementTree.fromstring(xml)
+
+    except (
+        KeyError,
+        zipfile.BadZipFile,
+        ElementTree.ParseError,
+    ) as exc:
+        raise ValueError("invalid DOCX resume") from exc
+
+    namespace = (
+        "{http://schemas.openxmlformats.org/"
+        "wordprocessingml/2006/main}"
     )
-    if start is None:
-        return ""
-    selected = []
-    for line in lines[start:]:
-        folded = line.casefold().rstrip(":")
-        if folded in stops:
+
+    paragraphs = []
+
+    for paragraph in root.iter(f"{namespace}p"):
+        text = "".join(
+            node.text or ""
+            for node in paragraph.iter(f"{namespace}t")
+        ).strip()
+
+        if text:
+            paragraphs.append(text)
+
+    extracted = "\n".join(paragraphs).strip()
+
+    if len(extracted) < 20:
+        raise ValueError(
+            "could not extract enough text from the DOCX resume"
+        )
+
+    return extracted
+
+def _pdf_resume_text(content: bytes) -> str:
+    errors = []
+
+    # First parser: pypdf
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(content), strict=False)
+
+        if reader.is_encrypted:
+            decrypt_result = reader.decrypt("")
+
+            if decrypt_result == 0:
+                raise ValueError(
+                    "password-protected PDF is not supported"
+                )
+
+        pages = []
+
+        for page in reader.pages:
+            try:
+                text = page.extract_text(
+                    extraction_mode="layout"
+                ) or ""
+            except TypeError:
+                # For older pypdf versions without extraction_mode.
+                text = page.extract_text() or ""
+
+            if text.strip():
+                pages.append(text)
+
+        extracted = "\n".join(pages).strip()
+
+        if len(extracted) >= 20:
+            return extracted
+
+        errors.append("pypdf returned insufficient text")
+
+    except Exception as exc:
+        errors.append(f"pypdf: {exc}")
+
+    # Second parser: PyMuPDF
+    try:
+        import fitz
+
+        document = fitz.open(
+            stream=content,
+            filetype="pdf",
+        )
+
+        pages = []
+
+        for page in document:
+            blocks = page.get_text("blocks")
+            blocks.sort(key=lambda block: (block[1], block[0]))
+
+            page_text = "\n".join(
+                str(block[4]).strip()
+                for block in blocks
+                if len(block) > 4 and str(block[4]).strip()
+            )
+
+            if page_text:
+                pages.append(page_text)
+
+        document.close()
+
+        extracted = "\n".join(pages).strip()
+
+        if len(extracted) >= 20:
+            return extracted
+
+        errors.append("PyMuPDF returned insufficient text")
+
+    except Exception as exc:
+        errors.append(f"PyMuPDF: {exc}")
+
+    event(
+        "profile",
+        "error",
+        "PDF extraction failed: " + "; ".join(errors),
+    )
+
+    raise ValueError(
+        "This PDF contains insufficient selectable text. "
+        "Upload a text-based PDF or DOCX file. "
+        "A scanned or image-only PDF requires OCR."
+    )
+
+
+import re
+from typing import Optional
+
+
+# Canonical headings supported by the parser.
+_SECTION_HEADINGS = {
+    "summary": {
+        "summary",
+        "profile",
+        "professional summary",
+        "career summary",
+        "executive summary",
+        "about me",
+    },
+    "skills": {
+        "skills",
+        "skill summary",
+        "skills summary",
+        "technical skills",
+        "core skills",
+        "core competencies",
+        "technologies",
+        "technical expertise",
+    },
+    "experience": {
+        "experience",
+        "work experience",
+        "professional experience",
+        "employment",
+        "employment history",
+        "work history",
+        "career history",
+    },
+    "certifications": {
+        "certification",
+        "certifications",
+        "certifications and achievements",
+        "certifications & achievements",
+        "achievements",
+        "awards",
+        "awards and achievements",
+        "awards & achievements",
+    },
+    "education": {
+        "education",
+        "academic background",
+        "academic qualifications",
+        "qualifications",
+        "educational qualifications",
+    },
+    "projects": {
+        "projects",
+        "project experience",
+        "personal projects",
+        "academic projects",
+    },
+}
+
+def _normalize_heading(value: str) -> str:
+    value = str(value or "").strip()
+
+    value = re.sub(r"^[\s#*_•\-–—:|]+", "", value)
+    value = re.sub(r"[\s#*_•\-–—:|]+$", "", value)
+    value = re.sub(r"\s*&\s*", " and ", value)
+    value = re.sub(r"\s+", " ", value)
+
+    return value.casefold().strip()
+
+def _heading_type(line: str) -> Optional[str]:
+    normalized = _normalize_heading(line)
+
+    if not normalized or len(normalized) > 80:
+        return None
+
+    for section_type, headings in _SECTION_HEADINGS.items():
+        normalized_headings = {
+            _normalize_heading(heading)
+            for heading in headings
+        }
+
+        if normalized in normalized_headings:
+            return section_type
+
+    return None
+
+def _clean_resume_lines(text: str) -> list[str]:
+    text = str(text or "").replace("\x00", " ")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    cleaned = []
+
+    for raw_line in text.splitlines():
+        line = re.sub(r"[ \t]+", " ", raw_line).strip()
+
+        line = re.sub(r"^\*+\s*", "", line)
+        line = re.sub(r"\s*\*+$", "", line)
+
+        if line:
+            cleaned.append(line)
+
+    return cleaned
+
+def _extract_section(lines: list[str], section_name: str) -> str:
+    """
+    Extract one section and stop at the next recognized heading.
+
+    This prevents Certifications, Achievements and Education from being
+    included in experience history.
+    """
+    start_index = None
+
+    for index, line in enumerate(lines):
+        if _heading_type(line) == section_name:
+            start_index = index + 1
             break
+
+    if start_index is None:
+        return ""
+
+    selected = []
+
+    for line in lines[start_index:]:
+        if _heading_type(line) is not None:
+            break
+
         selected.append(line)
+
     return "\n".join(selected).strip()[:10_000]
 
 
-def parse_resume(text: str) -> dict:
-    """Conservative, deterministic resume extraction. The user reviews every result."""
-    text = text.replace("\x00", " ")
-    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
-    lines = [line for line in lines if line]
-    joined = "\n".join(lines)
-    email = re.search(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", joined)
-    phone = re.search(r"(?<!\d)(?:\+?91[\s-]?)?[6-9]\d{9}(?!\d)", re.sub(r"[() ]", "", joined))
-    urls = re.findall(r"https?://[^\s|,;]+|(?:linkedin\.com|github\.com)/[^\s|,;]+", joined, re.I)
+def _looks_like_contact_line(line: str) -> bool:
+    folded = line.casefold()
 
-    name = ""
-    for line in lines[:8]:
-        if "@" in line or re.search(r"\d{6,}", line) or "http" in line.casefold():
-            continue
-        words = line.split()
-        if 2 <= len(words) <= 5 and len(line) <= 70:
-            name = line
+    return bool(
+        "@" in line
+        or "linkedin" in folded
+        or "github" in folded
+        or re.search(r"\+?\d[\d\s\-()]{8,}", line)
+    )
+
+
+def _extract_name(lines: list[str]) -> str:
+    for line in lines[:10]:
+        if _heading_type(line):
             break
+
+        if _looks_like_contact_line(line):
+            continue
+
+        candidate = re.sub(
+            r"\b(?:email|mobile|phone|linkedin)\s*:.*$",
+            "",
+            line,
+            flags=re.I,
+        ).strip()
+
+        words = candidate.split()
+
+        if (
+            2 <= len(words) <= 5
+            and len(candidate) <= 70
+            and not re.search(r"\d", candidate)
+        ):
+            return candidate.title() if candidate.isupper() else candidate
+
+    return ""
+
+def _extract_current_employment(
+    experience_text: str,
+) -> tuple[str, str]:
+
+    lines = [
+        re.sub(r"\s+", " ", line).strip()
+        for line in experience_text.splitlines()
+        if line.strip()
+    ]
+
+    if not lines:
+        return "", ""
 
     title = ""
-    start = lines.index(name) + 1 if name in lines else 0
-    for line in lines[start:start + 6]:
-        if "@" not in line and not re.search(r"\d{6,}", line) and len(line) <= 100:
-            title = line
+    company = ""
+
+    for line in lines[:5]:
+
+        if line.lower().startswith("client:"):
+            continue
+
+        if line.startswith(("•", "-", "*")):
+            continue
+
+        header = line
+
+        match = re.match(
+            r"^(?P<title>.+?)\s*(?:—|–|-| at )\s*(?P<company>.+)$",
+            header,
+            re.I,
+        )
+
+        if match:
+            title = match.group("title").strip()
+            company_text = match.group("company").strip()
+
+            company = company_text.split(",")[0].strip()
             break
 
-    skills = [
-        skill for skill in _SKILL_TERMS
-        if re.search(rf"(?<![a-z0-9]){re.escape(skill.casefold())}(?![a-z0-9])", joined.casefold())
-    ]
-    years = re.findall(r"(\d{1,2}(?:\.\d+)?)\s*\+?\s*years?", joined, re.I)
-    numeric_years = [float(value) for value in years if float(value) <= 50]
-    total_experience = f"{max(numeric_years):g} years" if numeric_years else ""
-    linkedin = next((url for url in urls if "linkedin.com" in url.casefold()), "")
-    github = next((url for url in urls if "github.com" in url.casefold()), "")
-    portfolio = next((url for url in urls if url not in {linkedin, github}), "")
-    all_headings = (
-        "experience", "work experience", "professional experience", "employment",
-        "education", "academic background", "qualifications", "skills",
-        "technical skills", "projects", "certifications", "summary", "profile",
+        parts = [p.strip() for p in header.split(",") if p.strip()]
+
+        if len(parts) >= 2:
+            title = parts[0]
+            company = parts[1]
+            break
+
+    return title[:150], company[:150]
+def _extract_total_experience(
+    text: str,
+    summary: str,
+) -> str:
+
+    search_text = summary or text
+
+    patterns = (
+        r"\b(?:over|more than)\s+(?P<value>\d+(?:\.\d+)?)\s+years?\b",
+        r"\b(?P<value>\d+(?:\.\d+)?)\s*\+?\s+years?(?:\s+of)?\s+(?:professional\s+)?experience\b",
+        r"\bexperience\s+of\s+(?P<value>\d+(?:\.\d+)?)\s*\+?\s+years?\b",
+        r"\b(?P<article>an|one)\s+year\s+of\s+experience\b",
     )
-    experience = _section(
+
+    for pattern in patterns:
+
+        match = re.search(pattern, search_text, re.I)
+
+        if not match:
+            continue
+
+        if match.groupdict().get("value"):
+            value = float(match.group("value"))
+
+            if 0 < value <= 50:
+                return f"{value:g} years"
+
+        if match.groupdict().get("article"):
+            return "1 year"
+
+    return ""
+
+
+def _extract_notice_period(text: str) -> str:
+    patterns = (
+        r"\bnotice period\s*[:\-]?\s*([^\n|,;]+)",
+        r"\b(?:available|availability)\s*[:\-]?\s*([^\n|,;]+)",
+        r"\b(immediate joiner)\b",
+        r"\b(serving notice period)\b",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+
+        if match:
+            value = match.group(1).strip()
+            return value[:120]
+
+    return ""
+
+def _extract_skills(skills_text: str, full_text: str) -> list[str]:
+
+    source_text = skills_text or full_text
+    folded = source_text.casefold()
+
+    discovered = []
+
+    for skill in _SKILL_TERMS:
+
+        pattern = (
+            rf"(?<![a-z0-9])"
+            rf"{re.escape(skill.casefold())}"
+            rf"(?![a-z0-9])"
+        )
+
+        if re.search(pattern, folded):
+            discovered.append(skill)
+
+    return discovered
+def parse_resume(text: str) -> dict:
+
+    lines = _clean_resume_lines(text)
+    joined = "\n".join(lines)
+
+    email_match = re.search(
+        r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+",
         joined,
-        ("experience", "work experience", "professional experience", "employment"),
-        all_headings,
     )
-    education = _section(
+
+    phone_match = re.search(
+        r"(?<!\d)(?:\+?91[\s-]?)?[6-9]\d{9}(?!\d)",
         joined,
-        ("education", "academic background", "qualifications"),
-        all_headings,
     )
-    summary = _section(joined, ("summary", "profile", "professional summary"), all_headings)
+
+    urls = re.findall(
+        r"https?://[^\s|,;]+|(?:linkedin\.com|github\.com)/[^\s|,;]+",
+        joined,
+        re.I,
+    )
+
+    summary = _extract_section(lines, "summary")
+    skills_text = _extract_section(lines, "skills")
+    experience = _extract_section(lines, "experience")
+    education = _extract_section(lines, "education")
+
+    current_title, current_company = _extract_current_employment(
+        experience
+    )
+
+    skills = _extract_skills(
+        skills_text,
+        joined,
+    )
+
+    linkedin = next(
+        (
+            url.rstrip(".)]")
+            for url in urls
+            if "linkedin.com" in url.casefold()
+        ),
+        "",
+    )
+
+    github = next(
+        (
+            url.rstrip(".)]")
+            for url in urls
+            if "github.com" in url.casefold()
+        ),
+        "",
+    )
+
+    portfolio = next(
+        (
+            url.rstrip(".)]")
+            for url in urls
+            if url not in {linkedin, github}
+        ),
+        "",
+    )
+
     return {
-        "fullName": name,
-        "email": email.group(0) if email else "",
-        "phone": phone.group(0) if phone else "",
-        "headline": title,
-        "currentTitle": title,
+        "fullName": _extract_name(lines),
+        "email": email_match.group(0) if email_match else "",
+        "phone": phone_match.group(0) if phone_match else "",
+        "headline": current_title,
+        "currentTitle": current_title,
+        "currentCompany": current_company,
         "summary": summary,
-        "totalExperience": total_experience,
+        "totalExperience": _extract_total_experience(
+            joined,
+            summary,
+        ),
+        "noticePeriod": _extract_notice_period(joined),
         "skills": skills,
         "linkedin": linkedin,
         "github": github,
@@ -1079,53 +1529,114 @@ def parse_resume(text: str) -> dict:
     }
 
 
-def upload_resume(payload: dict) -> dict:
+def upload_resume(uid: str, payload: dict) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("resume payload must be an object")
-    filename = Path(str(payload.get("filename") or "")).name
+
+    uid = str(uid or "").strip()
+
+    if not uid:
+        raise ValueError("authenticated user UID is required")
+
+    filename = Path(
+        str(payload.get("filename") or "")
+    ).name
+
     suffix = Path(filename).suffix.casefold()
+
+    if suffix not in {".pdf", ".docx", ".txt"}:
+        raise ValueError(
+            "resume must be a PDF, DOCX, or TXT file"
+        )
+
     encoded = payload.get("content")
+
     if not isinstance(encoded, str):
         raise ValueError("resume content is required")
+
     try:
-        content = base64.b64decode(encoded, validate=True)
+        content = base64.b64decode(
+            encoded,
+            validate=True,
+        )
     except (binascii.Error, ValueError) as exc:
-        raise ValueError("resume content must be base64") from exc
+        raise ValueError(
+            "resume content must be valid base64"
+        ) from exc
+
     if not content:
         raise ValueError("resume is empty")
+
     if len(content) > MAX_RESUME_BYTES:
-        raise ValueError("resume must be 8 MB or smaller")
+        raise ValueError(
+            "resume must be 8 MB or smaller"
+        )
 
     text = _resume_text(content, suffix)
+
     if len(text.strip()) < 20:
-        raise ValueError("could not extract enough text from this resume")
+        raise ValueError(
+            "could not extract enough text from this resume"
+        )
+
     extracted = parse_resume(text)
-    RESUME_DIR.mkdir(parents=True, exist_ok=True)
-    for old in RESUME_DIR.glob("resume.*"):
-        old.unlink(missing_ok=True)
-    resume_path = RESUME_DIR / f"resume{suffix}"
-    resume_path.write_bytes(content)
+
+    uploaded_at = datetime.now(
+        timezone.utc
+    ).isoformat()
 
     with _profile_lock:
-        profile = read_profile()
-        # A new resume refreshes fields it can identify and preserves preferences
-        # such as locations, work modes, salary, and manually entered values it cannot.
+        profile = read_profile(uid)
+
+        # Update only fields that were successfully extracted.
+        # Existing manually entered data remains unchanged when
+        # the parser cannot identify a value.
         for field, value in extracted.items():
             if value:
                 profile[field] = value
-        uploaded = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
         profile["resume"] = {
             "filename": filename,
             "size": len(content),
-            "uploadedAt": uploaded,
+            "uploadedAt": uploaded_at,
             "type": suffix.lstrip(".").upper(),
         }
-        profile["updatedAt"] = uploaded
-        profile.pop("completion", None)
-        _write_json(PROFILE_FILE, profile)
-    event("profile", "info", f"resume uploaded filename={filename} bytes={len(content)}")
-    return {"profile": read_profile(), "extracted": extracted}
 
+        profile["updatedAt"] = uploaded_at
+        profile.pop("completion", None)
+
+        try:
+            _profile_document(uid).set(
+                profile,
+                merge=True,
+            )
+        except Exception as exc:
+            event(
+                "profile",
+                "error",
+                (
+                    "resume profile save failed "
+                    f"uid={uid}: {exc}"
+                ),
+            )
+            raise ValueError(
+                "could not save parsed resume profile"
+            ) from exc
+
+    event(
+        "profile",
+        "info",
+        (
+            f"resume parsed uid={uid} "
+            f"filename={filename} "
+            f"bytes={len(content)}"
+        ),
+    )
+
+    return {
+        "profile": read_profile(uid),
+        "extracted": extracted,
+    }
 
 SNAPSHOT_VERSION = 3
 
