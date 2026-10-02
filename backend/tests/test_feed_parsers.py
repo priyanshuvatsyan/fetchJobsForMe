@@ -352,6 +352,85 @@ B.Tech Computer Science, Example University
             server.RESUME_DIR = original_resume
 
 
+    def test_apply_link_falls_back_to_job_url(self):
+        from Server.api import Job, apply_url_from_html
+        from Server.feeds import job_record
+
+        html = """
+        <a href="https://in.indeed.com/viewjob?jk=abc">Software Engineer</a>
+        <a href="https://jobs.acme.example/apply/42">Apply on company site</a>
+        <a href="https://accounts.google.com/signin">Apply with Google</a>
+        """
+        self.assertEqual(
+            apply_url_from_html(html, "https://in.indeed.com/viewjob?jk=abc"),
+            "https://jobs.acme.example/apply/42",
+        )
+        same = job_record(Job(
+            source="Indeed",
+            title="Software Engineer",
+            company="Acme",
+            location="Bengaluru",
+            url="https://in.indeed.com/viewjob?jk=abc",
+        ), "indeed")
+        self.assertEqual(same["apply"], same["link"])
+        separate = job_record(Job(
+            source="Indeed",
+            title="Software Engineer",
+            company="Acme",
+            location="Bengaluru",
+            url="https://in.indeed.com/viewjob?jk=abc",
+            apply_url="https://jobs.acme.example/apply/42",
+        ), "indeed")
+        self.assertEqual(separate["link"], "https://in.indeed.com/viewjob?jk=abc")
+        self.assertEqual(separate["apply"], "https://jobs.acme.example/apply/42")
+
+    def test_indeed_card_parser(self):
+        from Server.api import is_tech_role, keeps_india_hybrid_or_remote
+        from connectors.Indeed.Indeed import cards_from_html, detail_from_html, search_url
+
+        cards = cards_from_html("""
+        <div class="job_seen_beacon">
+          <h2 class="jobTitle"><a class="jcs-JobTitle" data-jk="abc123">Software Engineer</a></h2>
+          <span data-testid="company-name">Acme Labs</span>
+          <div data-testid="text-location">Hybrid work in Bengaluru, Karnataka</div>
+          <div data-testid="attribute_snippet_testid salary-snippet-container">₹10,00,000 a year</div>
+        </div>
+        <div class="job_seen_beacon">
+          <a class="jcs-JobTitle" data-jk="abc123">Software Engineer</a>
+        </div>
+        """)
+        self.assertEqual(len(cards), 1)
+        card = cards[0]
+        self.assertEqual(card["title"], "Software Engineer")
+        self.assertEqual(card["company"], "Acme Labs")
+        self.assertEqual(card["location"], "Hybrid work in Bengaluru, Karnataka")
+        self.assertEqual(card["salary"], "₹10,00,000 a year")
+        self.assertEqual(card["url"], "https://in.indeed.com/viewjob?jk=abc123")
+        self.assertTrue(is_tech_role(card["title"]))
+        self.assertTrue(keeps_india_hybrid_or_remote(card["location"]))
+        self.assertIn("l=India", search_url("software engineer", 0, remote=False, fromage=15))
+        self.assertIn("l=Remote", search_url("software engineer", 10, remote=True, fromage=1))
+        detail = detail_from_html("""
+        <script type="application/ld+json">
+        {
+          "@type": "JobPosting",
+          "title": "Software Engineer",
+          "datePosted": "2026-10-01T04:00:00Z",
+          "description": "<p>About Acme Labs.</p><p>Build services with Python. 2 years of experience.</p>",
+          "skills": ["Python", "SQL"],
+          "hiringOrganization": {"name": "Acme Labs"},
+          "jobLocation": {"address": {"addressLocality": "Bengaluru", "addressRegion": "Karnataka"}},
+          "baseSalary": {"currency": "INR", "value": {"minValue": 200000, "maxValue": 800000, "unitText": "YEAR"}}
+        }
+        </script>
+        """)
+        self.assertIn("Build services with Python", detail["description"])
+        self.assertEqual(detail["skill"], "Python, SQL")
+        self.assertEqual(detail["posted_at"], "2026-10-01 04:00:00")
+        self.assertIn("2 years", detail["experience"])
+        self.assertEqual(detail["salary"], "₹200,000 - ₹800,000 a year")
+        self.assertEqual(detail["location"], "Bengaluru, Karnataka")
+
     def test_naukri_card_parser(self):
         from Server.api import is_tech_role, keeps_india_hybrid_or_remote, within_days
         from connectors.Naukri.Naukri import cards_from_html, posted_from_label, search_url
@@ -431,8 +510,15 @@ B.Tech Computer Science, Example University
             <div>Education</div>
             <div><label>UG: </label><span>Any Graduate</span></div>
           </div>
-          <h2>Key Skills</h2>
+          <h2><span>Key Skills</span></h2>
+          <div>Skills highlighted with preferred keyskills</div>
           <div>Maintenance</div>
+          <h3>Report this job</h3>
+          <div>Inappropriate Content</div>
+          <div>Beware of imposters!</div>
+          <div>Naukri.com does not promise a job or an interview in exchange of money.</div>
+          <div>Connect with us</div>
+          <div>Apply on the go</div>
         </section>
         """)
         self.assertIn("Works in the area of Software Engineering", plain["description"])
@@ -442,6 +528,10 @@ B.Tech Computer Science, Example University
         self.assertIn("Role: Software Development - Other", plain["description"])
         self.assertIn("UG: Any Graduate", plain["description"])
         self.assertNotIn("Maintenance", plain["description"])
+        self.assertNotIn("Report this job", plain["description"])
+        self.assertNotIn("Beware of imposters", plain["description"])
+        self.assertNotIn("Connect with us", plain["description"])
+        self.assertNotIn("Apply on the go", plain["description"])
 
     def test_user_search_preferences_filter_jobs(self):
         import tempfile

@@ -21,6 +21,7 @@ from Server.control import pause, stale, token
 from Server.feeds import _matches_saved_search, get_store, role_matches, search_phrases
 from Server.api import (
     Job,
+    apply_url_from_html,
     clean,
     extract_salary,
     is_tech_role,
@@ -308,6 +309,7 @@ def extract_job_details(url: str, card_posted: str = "") -> dict:
         "about_company": "",
         "job_description": "",
         "posted_at": card_posted,
+        "apply_url": "",
     }
     try:
         response = _session.get(url, timeout=30)
@@ -351,6 +353,7 @@ def extract_job_details(url: str, card_posted: str = "") -> dict:
         "about_company": about_company,
         "job_description": job_description or plain_text(body),
         "posted_at": posted,
+        "apply_url": apply_url_from_html(response.text, url),
     }
 
 
@@ -526,6 +529,7 @@ class LinkedIn:
                         salary=details["salary"] or "",
                         about_company=details["about_company"] or "",
                         job_description=details["job_description"] or "",
+                        apply_url=details.get("apply_url") or "",
                     )
                     if not _matches_saved_search(
                         job,

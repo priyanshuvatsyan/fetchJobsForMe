@@ -63,6 +63,43 @@ class Job:
     job_description: str = ""
     openings: str = ""
     applicants: str = ""
+    apply_url: str = ""
+
+
+def apply_url_from_html(html: str, page_url: str = "") -> str:
+    """Company or portal apply link from a job page. Empty when the page has no separate apply link."""
+    from urllib.parse import urljoin
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html or "", "html.parser")
+    page = urljoin(page_url, page_url).split("#")[0].rstrip("/") if page_url else ""
+    found = ""
+    for anchor in soup.find_all("a", href=True):
+        href = urljoin(page_url or "", anchor.get("href") or "").split("#")[0].strip()
+        if not href.startswith(("http://", "https://")):
+            continue
+        label = " ".join(
+            part
+            for part in (
+                clean(anchor.get_text(" ", strip=True)),
+                clean(anchor.get("aria-label")),
+                clean(anchor.get("id")),
+                clean(anchor.get("title")),
+                " ".join(anchor.get("class") or []),
+            )
+            if part
+        ).casefold()
+        target = href.casefold()
+        if any(word in target for word in ("login", "signin", "sign-in", "signup", "accounts.google")):
+            continue
+        if "apply" not in label and "apply" not in target:
+            continue
+        if page and href.rstrip("/") == page:
+            continue
+        found = href
+        if label.startswith("apply"):
+            return href
+    return found
 
 
 _YEARS = re.compile(

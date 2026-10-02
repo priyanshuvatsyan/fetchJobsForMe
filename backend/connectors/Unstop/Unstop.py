@@ -311,6 +311,12 @@ class Unstop:
                     skill = format_skills(item.get("required_skills"))
                     if not skill:
                         skill = job_profile(title, body)[1]
+                    apply = clean(
+                        item.get("apply_link")
+                        or item.get("external_link")
+                        or detail.get("apply_link")
+                        or ""
+                    )
                     job = Job(
                         source=self.label,
                         title=title,
@@ -323,6 +329,7 @@ class Unstop:
                         salary=salary_text(detail),
                         about_company=about_company,
                         job_description=job_description or body,
+                        apply_url=apply,
                     )
                 except (TypeError, ValueError) as error:
                     print(f"Skipped a listing: {error}")

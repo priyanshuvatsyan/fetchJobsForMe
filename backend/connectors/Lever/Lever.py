@@ -97,6 +97,7 @@ class Lever:
                         company=company,
                         location=place,
                         url=clean(item.get("hostedUrl") or item.get("applyUrl")),
+                        apply_url=clean(item.get("applyUrl")),
                         posted_at=posted_at,
                         experience=experience,
                         skill=skill,
