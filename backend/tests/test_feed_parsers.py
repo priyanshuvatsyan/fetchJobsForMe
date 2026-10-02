@@ -271,13 +271,10 @@ class FeedParserTests(unittest.TestCase):
         self.assertIs(kept, with_portal_key(kept))
 
     def test_saved_jobs_round_trip(self):
-        import tempfile
-        from pathlib import Path
-
         import Server.server as server
 
-        original = server.SAVED_FILE
-        server.SAVED_FILE = Path(tempfile.mkdtemp()) / "saved_jobs.json"
+        original = server._saved_memory
+        server._saved_memory = {}
         try:
             job = {
                 "portal": "4 Day Week",
@@ -288,20 +285,20 @@ class FeedParserTests(unittest.TestCase):
                 "description": {"about company": "", "job description": "Fix things"},
                 "unexpected": "dropped",
             }
-            stored = server.save_job(job)
+            stored = server.save_job("user-one", job)
             self.assertEqual(stored["portalKey"], "fourdayweek")
             self.assertTrue(stored["saved at"])
             self.assertNotIn("unexpected", stored)
-            self.assertEqual(server.save_job(job)["saved at"], stored["saved at"])
-            self.assertEqual(len(server.read_saved()), 1)
+            self.assertEqual(server.save_job("user-one", job)["saved at"], stored["saved at"])
+            self.assertEqual(len(server.read_saved("user-one")), 1)
+            self.assertEqual(server.read_saved("user-two"), [])
             with self.assertRaises(ValueError):
-                server.save_job({"role": "No link"})
-            self.assertTrue(server.unsave_job(job["link"]))
-            self.assertFalse(server.unsave_job(job["link"]))
-            self.assertEqual(server.read_saved(), [])
+                server.save_job("user-one", {"role": "No link"})
+            self.assertTrue(server.unsave_job("user-one", job["link"]))
+            self.assertFalse(server.unsave_job("user-one", job["link"]))
+            self.assertEqual(server.read_saved("user-one"), [])
         finally:
-            server.SAVED_FILE.unlink(missing_ok=True)
-            server.SAVED_FILE = original
+            server._saved_memory = original
 
     def test_resume_import_and_manual_profile_update(self):
         import base64
@@ -310,9 +307,22 @@ class FeedParserTests(unittest.TestCase):
 
         import Server.server as server
 
-        root = Path(tempfile.mkdtemp())
-        original_profile, original_resume = server.PROFILE_FILE, server.RESUME_DIR
-        server.PROFILE_FILE, server.RESUME_DIR = root / "profile.json", root / "resume"
+        store = {"data": None}
+
+        class _Document:
+            def get(self):
+                class _Snapshot:
+                    exists = store["data"] is not None
+                    def to_dict(_self):
+                        return dict(store["data"] or {})
+                return _Snapshot()
+
+            def set(self, data, merge=False):
+                current = dict(store["data"] or {})
+                store["data"] = {**current, **data} if merge else dict(data)
+
+        original_document = server._profile_document
+        server._profile_document = lambda uid: _Document()
         resume = """Shubhak Example
 Senior Backend Engineer
 shubhak@example.com | +91 9876543210
@@ -329,7 +339,7 @@ EDUCATION
 B.Tech Computer Science, Example University
 """
         try:
-            result = server.upload_resume({
+            result = server.upload_resume("user-one", {
                 "filename": "resume.txt",
                 "content": base64.b64encode(resume.encode()).decode(),
             })
@@ -339,7 +349,7 @@ B.Tech Computer Science, Example University
             self.assertIn("Python", profile["skills"])
             self.assertIn("FastAPI", profile["skills"])
             self.assertEqual(profile["resume"]["filename"], "resume.txt")
-            updated = server.update_profile({
+            updated = server.update_profile("user-one", {
                 "targetRoles": ["Backend Engineer"],
                 "preferredLocations": ["Bengaluru", "Remote"],
                 "openToWork": True,
@@ -348,8 +358,7 @@ B.Tech Computer Science, Example University
             self.assertEqual(updated["targetRoles"], ["Backend Engineer"])
             self.assertGreater(updated["completion"], profile["completion"])
         finally:
-            server.PROFILE_FILE = original_profile
-            server.RESUME_DIR = original_resume
+            server._profile_document = original_document
 
 
     def test_unstop_keeps_structure_and_fresher_eligibility(self):

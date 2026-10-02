@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hashlib
 import io
 import json
 import logging
@@ -27,13 +28,12 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from xml.etree import ElementTree
 import os
-from firebase import get_firestore_client
-
 
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
+from Server.firebase import get_firestore_client, uid_from_authorization
 from Server.gemini_service import get_user_gemini_client
 
 _LOGGER = logging.getLogger("fetchjobs")
@@ -644,22 +644,50 @@ def write_jobs_file(payload: dict) -> None:
     _write_json(JOBS_FILE, payload)
 
 
-SAVED_FILE = JOBS_FILE.parent / "saved_jobs.json"
 _saved_lock = threading.Lock()
+# Tests set this to a dict. The API leaves it empty and uses Firestore.
+_saved_memory: dict | None = None
 _SAVED_FIELDS = (
     "portal", "portalKey", "company", "role", "experience",
     "skill", "salary", "added on", "location", "link", "apply",
 )
 
 
-def read_saved() -> list[dict]:
+def _saved_collection(uid: str):
+    uid = str(uid or "").strip()
+    if not uid:
+        raise ValueError("sign in is required")
+    return (
+        get_firestore_client()
+        .collection("users")
+        .document(uid)
+        .collection("savedJobs")
+    )
+
+
+def _saved_doc_id(link: str) -> str:
+    return hashlib.sha256(link.encode("utf-8")).hexdigest()
+
+
+def read_saved(uid: str) -> list[dict]:
+    """Saved jobs for one signed-in user. Each user has their own Firestore list."""
+    uid = str(uid or "").strip()
+    if not uid:
+        raise ValueError("sign in is required")
+    if _saved_memory is not None:
+        return [dict(item) for item in _saved_memory.get(uid, []) if item.get("link")]
     try:
-        payload = json.loads(SAVED_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    if not isinstance(payload, list):
-        return []
-    return [item for item in payload if isinstance(item, dict) and item.get("link")]
+        documents = _saved_collection(uid).stream()
+    except Exception as exc:
+        event("saved", "error", f"read failed: {exc}")
+        raise ValueError("could not read saved jobs") from exc
+    jobs = []
+    for document in documents:
+        item = document.to_dict() or {}
+        if isinstance(item, dict) and item.get("link"):
+            jobs.append(item)
+    jobs.sort(key=lambda item: item.get("saved at") or "", reverse=True)
+    return jobs
 
 
 def _saved_record(record: dict) -> dict:
@@ -684,26 +712,59 @@ def _saved_record(record: dict) -> dict:
     return with_portal_key(clean)
 
 
-def save_job(record: dict) -> dict:
+def save_job(uid: str, record: dict) -> dict:
+    uid = str(uid or "").strip()
+    if not uid:
+        raise ValueError("sign in is required")
     job = _saved_record(record)
+    job_id = _saved_doc_id(job["link"])
     with _saved_lock:
-        saved = read_saved()
-        existing = next((item for item in saved if item["link"] == job["link"]), None)
-        if existing is not None:
-            return existing
-        job["saved at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        _write_json(SAVED_FILE, [job, *saved])
+        if _saved_memory is not None:
+            bucket = _saved_memory.setdefault(uid, [])
+            existing = next((item for item in bucket if item["link"] == job["link"]), None)
+            if existing is not None:
+                event("saved", "info", f"already saved {job['role']} — {job['company']}")
+                return dict(existing)
+            job["saved at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            bucket.insert(0, job)
+        else:
+            document = _saved_collection(uid).document(job_id)
+            try:
+                current = document.get()
+                if current.exists:
+                    stored = current.to_dict() or job
+                    event("saved", "info", f"already saved {job['role']} — {job['company']}")
+                    return stored
+                job["saved at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                document.set(job)
+            except Exception as exc:
+                event("saved", "error", f"save failed: {exc}")
+                raise ValueError("could not save job") from exc
     event(job.get("portalKey") or "saved", "info", f"saved {job['role']} — {job['company']}")
     return job
 
 
-def unsave_job(link: str) -> bool:
+def unsave_job(uid: str, link: str) -> bool:
+    uid = str(uid or "").strip()
+    if not uid:
+        raise ValueError("sign in is required")
     with _saved_lock:
-        saved = read_saved()
-        remaining = [item for item in saved if item["link"] != link]
-        if len(remaining) == len(saved):
-            return False
-        _write_json(SAVED_FILE, remaining)
+        if _saved_memory is not None:
+            bucket = _saved_memory.get(uid, [])
+            remaining = [item for item in bucket if item["link"] != link]
+            if len(remaining) == len(bucket):
+                return False
+            _saved_memory[uid] = remaining
+        else:
+            document = _saved_collection(uid).document(_saved_doc_id(link))
+            try:
+                current = document.get()
+                if not current.exists:
+                    return False
+                document.delete()
+            except Exception as exc:
+                event("saved", "error", f"remove failed: {exc}")
+                raise ValueError("could not remove saved job") from exc
     event("saved", "info", f"removed {link}")
     return True
 
@@ -794,7 +855,7 @@ def update_preferences(uid: str, changes: dict) -> dict:
     }
     with _preferences_lock:
         _write_json(_preference_file(uid), preferences)
-    event("preferences", "info", f"updated uid={uid[:8]} roles={len(preferences['roles'])}")
+    event("preferences", "info", f"updated roles={len(preferences['roles'])}")
     return preferences
 
 
@@ -922,7 +983,7 @@ def read_profile(uid: str) -> dict:
         event(
             "profile",
             "error",
-            f"profile read failed uid={uid}: {exc}",
+            f"profile read failed: {exc}",
         )
         raise ValueError("could not read profile") from exc
 
@@ -1010,11 +1071,11 @@ def update_profile(uid: str, changes: dict) -> dict:
             event(
                 "profile",
                 "error",
-                f"profile update failed uid={uid}: {exc}",
+                f"profile update failed: {exc}",
             )
             raise ValueError("could not update profile") from exc
 
-    event("profile", "info", f"profile updated uid={uid}")
+    event("profile", "info", "profile updated")
 
     return read_profile(uid)
 
@@ -1571,6 +1632,11 @@ def upload_resume(uid: str, payload: dict) -> dict:
             "resume must be 8 MB or smaller"
         )
 
+    event(
+        "profile",
+        "info",
+        f"resume uploaded filename={filename} bytes={len(content)}",
+    )
     text = _resume_text(content, suffix)
 
     if len(text.strip()) < 20:
@@ -1579,6 +1645,12 @@ def upload_resume(uid: str, payload: dict) -> dict:
         )
 
     extracted = parse_resume(text)
+    filled = [name for name, value in extracted.items() if value]
+    event(
+        "profile",
+        "info",
+        f"resume parsed filename={filename} fields={', '.join(filled) or 'none'}",
+    )
 
     uploaded_at = datetime.now(
         timezone.utc
@@ -1614,8 +1686,7 @@ def upload_resume(uid: str, payload: dict) -> dict:
                 "profile",
                 "error",
                 (
-                    "resume profile save failed "
-                    f"uid={uid}: {exc}"
+                    f"resume profile save failed: {exc}"
                 ),
             )
             raise ValueError(
@@ -1625,11 +1696,7 @@ def upload_resume(uid: str, payload: dict) -> dict:
     event(
         "profile",
         "info",
-        (
-            f"resume parsed uid={uid} "
-            f"filename={filename} "
-            f"bytes={len(content)}"
-        ),
+        f"parsed details saved filename={filename}",
     )
 
     return {
@@ -1911,7 +1978,7 @@ def _current_view() -> dict:
     return _respond(payload)
 
 
-def jobs_summary() -> dict:
+def jobs_summary(uid: str = "") -> dict:
     view = _current_view()
     counts: dict[str, int] = {}
     new_today = 0
@@ -1928,12 +1995,18 @@ def jobs_summary() -> dict:
         if counts.get(portal["key"])
     ]
     sources.sort(key=lambda source: source["count"], reverse=True)
+    saved_count = 0
+    if uid:
+        try:
+            saved_count = len(read_saved(uid))
+        except ValueError:
+            saved_count = 0
     return {
         "sourcesConnected": len(sources),
         "sources": sources,
         "total": len(view.get("jobs") or []),
         "newToday": new_today,
-        "saved": len(read_saved()),
+        "saved": saved_count,
         "loading": bool(view.get("loading")),
         "fetchedAt": view.get("fetchedAt") or "",
     }
@@ -1958,20 +2031,50 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok"})
             return
         if route.path == "/api/jobs/stop":
+            event("jobs", "info", "stop requested")
             self._send_json(200, stop_fetches())
             return
         if route.path == "/api/portals":
             self._send_json(200, {"portals": _portal_catalog()})
             return
         if route.path == "/api/saved":
-            saved = read_saved()
+            uid = self._user_id("saved")
+            if not uid:
+                return
+            try:
+                saved = read_saved(uid)
+            except ValueError as exc:
+                self._send_json(502, {"error": str(exc)})
+                return
             self._send_json(200, {"jobs": saved, "count": len(saved)})
             return
         if route.path == "/api/summary":
-            self._send_json(200, jobs_summary())
+            uid = ""
+            try:
+                uid = uid_from_authorization(self.headers.get("Authorization"))
+            except (ValueError, RuntimeError, FileNotFoundError):
+                uid = ""
+            self._send_json(200, jobs_summary(uid))
             return
         if route.path == "/api/profile":
-            self._send_json(200, {"profile": read_profile()})
+            try:
+                uid = uid_from_authorization(self.headers.get("Authorization"))
+            except ValueError as exc:
+                event("profile", "warning", f"profile read rejected: {exc}")
+                self._send_json(401, {"error": str(exc)})
+                return
+            except (RuntimeError, FileNotFoundError) as exc:
+                event("profile", "error", f"profile read failed: {exc}")
+                self._send_json(500, {"error": str(exc)})
+                return
+            try:
+                profile = read_profile(uid)
+            except ValueError as exc:
+                cause = exc.__cause__ or exc
+                self._send_json(502, {"error": f"{exc}: {cause}"})
+                return
+            event("profile", "info", f"profile loaded completion={profile.get('completion')}")
+            self._send_json(200, {"profile": profile})
             return
         if route.path == "/api/preferences":
             uid = (params.get("uid") or [""])[0].strip()
@@ -2013,9 +2116,11 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             try:
                 client, uid = get_user_gemini_client(auth_header)
             except ValueError as exc:
+                event("gemini", "warning", f"generate rejected: {exc}")
                 self._send_json(401, {"error": str(exc)})
                 return
             except Exception as exc:
+                event("gemini", "error", f"generate auth failed: {exc}")
                 self._send_json(500, {"error": f"Auth check failed: {exc}"})
                 return
 
@@ -2028,14 +2133,16 @@ class JobsApiHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "prompt is required"})
                 return
 
+            event("gemini", "info", f"generate started chars={len(prompt)}")
             try:
                 response = client.models.generate_content(
                     model="gemini-2.5-flash",
                     contents=prompt,
                 )
+                event("gemini", "info", "generate done")
                 self._send_json(200, {"result": response.text})
             except Exception as exc:
-                event("gemini", "error", f"Generation failed for uid={uid[:8]}: {exc}")
+                event("gemini", "error", f"generation failed: {exc}")
                 self._send_json(502, {"error": f"Gemini error: {exc}"})
             return
 
@@ -2043,9 +2150,21 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             if body is None:
                 return
+            filename = Path(str(body.get("filename") or "")).name if isinstance(body, dict) else ""
             try:
-                result = upload_resume(body)
+                uid = uid_from_authorization(self.headers.get("Authorization"))
             except ValueError as exc:
+                event("profile", "warning", f"resume upload rejected filename={filename or '-'}: {exc}")
+                self._send_json(401, {"error": str(exc)})
+                return
+            except (RuntimeError, FileNotFoundError) as exc:
+                event("profile", "error", f"resume upload failed filename={filename or '-'}: {exc}")
+                self._send_json(500, {"error": str(exc)})
+                return
+            try:
+                result = upload_resume(uid, body)
+            except ValueError as exc:
+                event("profile", "error", f"resume upload failed filename={filename or '-'}: {exc}")
                 self._send_json(400, {"error": str(exc)})
                 return
             self._send_json(200, result)
@@ -2057,12 +2176,17 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body is None:
             return
+        uid = self._user_id("saved")
+        if not uid:
+            return
         try:
-            job = save_job(body.get("job") if isinstance(body, dict) else None)
+            job = save_job(uid, body.get("job") if isinstance(body, dict) else None)
         except ValueError as exc:
+            if exc.__cause__ is None:
+                event("saved", "error", f"save failed: {exc}")
             self._send_json(400, {"error": str(exc)})
             return
-        self._send_json(201, {"job": job, "count": len(read_saved())})
+        self._send_json(201, {"job": job, "count": len(read_saved(uid))})
 
     def do_PUT(self) -> None:
         route = urlparse(self.path)
@@ -2081,14 +2205,28 @@ class JobsApiHandler(BaseHTTPRequestHandler):
                     body.get("preferences") if isinstance(body, dict) else None,
                 )
             except ValueError as exc:
+                event("preferences", "error", f"update failed: {exc}")
                 self._send_json(400, {"error": str(exc)})
                 return
             self._send_json(200, {"preferences": preferences})
             return
         try:
-            profile = update_profile(body.get("profile") if isinstance(body, dict) else None)
+            uid = uid_from_authorization(self.headers.get("Authorization"))
         except ValueError as exc:
-            self._send_json(400, {"error": str(exc)})
+            event("profile", "warning", f"profile update rejected: {exc}")
+            self._send_json(401, {"error": str(exc)})
+            return
+        except (RuntimeError, FileNotFoundError) as exc:
+            event("profile", "error", f"profile update failed: {exc}")
+            self._send_json(500, {"error": str(exc)})
+            return
+        try:
+            profile = update_profile(uid, body.get("profile") if isinstance(body, dict) else None)
+        except ValueError as exc:
+            cause = exc.__cause__
+            if cause is None:
+                event("profile", "error", f"profile update failed: {exc}")
+            self._send_json(400, {"error": f"{exc}: {cause}" if cause else str(exc)})
             return
         self._send_json(200, {"profile": profile})
 
@@ -2101,8 +2239,17 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         if not link:
             self._send_json(400, {"error": "link is required"})
             return
-        removed = unsave_job(link)
-        self._send_json(200 if removed else 404, {"removed": removed, "count": len(read_saved())})
+        uid = self._user_id("saved")
+        if not uid:
+            return
+        try:
+            removed = unsave_job(uid, link)
+        except ValueError as exc:
+            self._send_json(502, {"error": str(exc)})
+            return
+        if not removed:
+            event("saved", "warning", f"remove missed {link}")
+        self._send_json(200 if removed else 404, {"removed": removed, "count": len(read_saved(uid))})
 
     def _read_json(self):
         try:
@@ -2118,8 +2265,23 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "body must be JSON"})
             return None
 
+    def _user_id(self, area: str) -> str:
+        try:
+            return uid_from_authorization(self.headers.get("Authorization"))
+        except ValueError as exc:
+            event(area, "warning", f"rejected: {exc}")
+            self._send_json(401, {"error": str(exc)})
+        except (RuntimeError, FileNotFoundError) as exc:
+            event(area, "error", f"failed: {exc}")
+            self._send_json(500, {"error": str(exc)})
+        return ""
+
     def log_message(self, fmt: str, *args) -> None:
-        event("api", "info", f"{self.address_string()} {fmt % args}")
+        message = fmt % args
+        message = re.sub(r"([?&])uid=[^&\s\"]*", r"\1", message)
+        message = message.replace("?&", "?").replace("&&", "&")
+        message = re.sub(r"[?&](?=\s|HTTP)", "", message)
+        event("api", "info", f"{self.address_string()} {message}")
 
     def _send_cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
