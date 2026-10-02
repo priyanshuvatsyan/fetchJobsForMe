@@ -4,3 +4,6 @@ requests
 beautifulsoup4
 pypdf
 playwright
+playwright install
+firebase-admin>=6.5.0
+google-genai>=0.1.1
