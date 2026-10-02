@@ -5,6 +5,7 @@ export const DEFAULT_PREFERENCES = {
   experience: null,
   posted: 'all',
   roles: [],
+  geminiApiKey: '',
   updatedAt: '',
 }
 
