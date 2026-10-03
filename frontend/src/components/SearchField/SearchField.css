@@ -38,18 +38,25 @@
   width: 100%;
   padding: 10px 0;
   border: none;
+  outline: none;
+  box-shadow: none;
   background: transparent;
   color: var(--jb-text);
   font-family: inherit;
   font-size: 14px;
+  appearance: none;
 }
 
 .search-field-input input::placeholder {
   color: var(--jb-text-faint);
 }
 
-.search-field-input input:focus {
+.search-field-input input:focus,
+.search-field-input input:focus-visible {
   outline: none;
+  border: none;
+  box-shadow: none;
+  background: transparent;
 }
 
 .search-field-input input::-webkit-search-cancel-button {

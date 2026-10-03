@@ -671,7 +671,7 @@ def _saved_collection(uid: str):
 
 def _saved_document(uid: str):
     """One document per user. Starring or removing a job replaces this document."""
-    return _saved_collection(uid).document("current")
+    return _saved_collection(uid).document("saved_jobs")
 
 
 def _jobs_in_saved_document(payload: dict) -> list[dict]:
@@ -684,27 +684,32 @@ def _jobs_in_saved_document(payload: dict) -> list[dict]:
 
 
 def _load_saved_jobs(uid: str) -> list[dict]:
-    """Read the one saved-jobs document. Older per-job documents are folded in, then deleted."""
+    """Read users/{uid}/savedJobs/saved_jobs. Older documents are folded in, then deleted."""
     document = _saved_document(uid)
     current = document.get()
+    legacy = []
     if current.exists:
         jobs = _jobs_in_saved_document(current.to_dict() or {})
     else:
         jobs = []
-    legacy = []
-    if not current.exists:
-        for old in _saved_collection(uid).stream():
-            if old.id == "current":
-                continue
-            item = old.to_dict() or {}
-            if item.get("link"):
-                jobs.append(item)
-                legacy.append(old)
+        previous = _saved_collection(uid).document("current").get()
+        if previous.exists:
+            jobs = _jobs_in_saved_document(previous.to_dict() or {})
+            legacy.append(previous.reference)
+        else:
+            for old in _saved_collection(uid).stream():
+                if old.id in {"saved_jobs", "current"}:
+                    continue
+                item = old.to_dict() or {}
+                found = _jobs_in_saved_document(item)
+                if found:
+                    jobs.extend(found)
+                    legacy.append(old.reference)
     if legacy:
         jobs.sort(key=lambda item: item.get("saved at") or "", reverse=True)
         document.set({"jobs": jobs})
         for old in legacy:
-            old.reference.delete()
+            old.delete()
     return jobs
 
 
@@ -2237,6 +2242,11 @@ def _blank_search() -> dict:
     }
 
 
+def _fetched_jobs_id(index: int) -> str:
+    """First result document is jobs. Extra documents exist only past the size limit."""
+    return "jobs" if index == 0 else f"jobs-{index + 1}"
+
+
 def _chunk_jobs(jobs: list[dict]) -> list[list[dict]]:
     """Split a result list into pieces that fit in one Firestore document."""
     parts: list[list[dict]] = []
@@ -2286,7 +2296,7 @@ def _job_search_collection(uid: str):
 
 
 def replace_user_jobs(uid: str, payload: dict) -> None:
-    """Overwrite this user's search. Older part documents are deleted."""
+    """Overwrite this user's search. The job list is stored in the jobs document."""
     uid = str(uid or "").strip()
     if not uid:
         return
@@ -2295,17 +2305,22 @@ def replace_user_jobs(uid: str, payload: dict) -> None:
     if _job_search_memory is not None:
         _job_search_memory[uid] = {**record, "jobs": jobs}
         return
-    parts = _chunk_jobs(jobs)
-    record["parts"] = len(parts)
+    chunks = _chunk_jobs(jobs)
+    record["jobDocuments"] = len(chunks)
     collection = _job_search_collection(uid)
-    previous = 0
+    previous_jobs = 0
+    previous_parts = 0
     status = collection.document("status").get()
     if status.exists:
-        previous = int((status.to_dict() or {}).get("parts") or 0)
+        stored = status.to_dict() or {}
+        previous_jobs = int(stored.get("jobDocuments") or 0)
+        previous_parts = int(stored.get("parts") or 0)
     collection.document("status").set(record)
-    for index, part in enumerate(parts):
-        collection.document(f"part-{index}").set({"jobs": part})
-    for index in range(len(parts), max(previous, len(parts))):
+    for index, chunk in enumerate(chunks):
+        collection.document(_fetched_jobs_id(index)).set({"jobs": chunk})
+    for index in range(len(chunks), max(previous_jobs, len(chunks))):
+        collection.document(_fetched_jobs_id(index)).delete()
+    for index in range(previous_parts):
         collection.document(f"part-{index}").delete()
 
 
@@ -2326,14 +2341,24 @@ def read_user_jobs(uid: str) -> dict | None:
     if not status.exists:
         return None
     record = status.to_dict() or {}
-    parts = int(record.pop("parts", 0) or 0)
+    document_count = int(record.pop("jobDocuments", 0) or 0)
+    legacy_parts = int(record.pop("parts", 0) or 0)
     jobs: list[dict] = []
     collection = _job_search_collection(uid)
-    for index in range(parts):
-        part = collection.document(f"part-{index}").get()
+    if document_count:
+        names = [_fetched_jobs_id(index) for index in range(document_count)]
+    else:
+        names = [f"part-{index}" for index in range(legacy_parts)]
+    for name in names:
+        part = collection.document(name).get()
         chunk = (part.to_dict() or {}).get("jobs") if part.exists else []
         if isinstance(chunk, list):
             jobs.extend(item for item in chunk if isinstance(item, dict))
+    if legacy_parts and not document_count and jobs:
+        try:
+            replace_user_jobs(uid, {**record, "jobs": jobs})
+        except Exception as exc:
+            event("jobs", "error", f"search rename failed: {exc}")
     record["jobs"] = jobs
     record["count"] = len(jobs)
     record["cached"] = True

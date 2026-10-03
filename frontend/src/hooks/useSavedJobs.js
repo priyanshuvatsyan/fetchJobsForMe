@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { onAuthStateChanged } from 'firebase/auth'
 import { fetchSavedJobs, saveJob, unsaveJob } from '../api/saved'
+import { auth } from '../firebase'
 
 /**
  * Starred jobs, stored in Firebase under the signed-in user.
@@ -13,17 +15,28 @@ export function useSavedJobs() {
 
   useEffect(() => {
     const controller = new AbortController()
-    fetchSavedJobs(controller.signal)
-      .then((jobs) => {
-        setSaved(jobs)
-        setStatus('success')
-      })
-      .catch((cause) => {
-        if (cause.name === 'AbortError') return
-        setError(cause)
-        setStatus('error')
-      })
-    return () => controller.abort()
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (!user) {
+        setSaved([])
+        setError(null)
+        setStatus('idle')
+        return
+      }
+      fetchSavedJobs(controller.signal)
+        .then((jobs) => {
+          setSaved(jobs)
+          setStatus('success')
+        })
+        .catch((cause) => {
+          if (cause.name === 'AbortError' || cause.status === 401) return
+          setError(cause)
+          setStatus('error')
+        })
+    })
+    return () => {
+      controller.abort()
+      unsubscribe()
+    }
   }, [])
 
   const savedLinks = useMemo(() => new Set(saved.map((job) => job.link)), [saved])

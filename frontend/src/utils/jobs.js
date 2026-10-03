@@ -225,9 +225,38 @@ export function isWithinRange(job, rangeKey) {
   return Date.now() - date.getTime() <= days * 86_400_000
 }
 
-function includes(haystack, needle) {
-  const text = needle.trim().toLowerCase()
-  return !text || haystack.toLowerCase().includes(text)
+function searchTerms(value) {
+  return String(value || '')
+    .split(',')
+    .map((term) => term.trim().toLowerCase())
+    .filter(Boolean)
+}
+
+const PLACE_GROUPS = [
+  ['bangalore', 'bengaluru', 'blr'],
+  ['hyderabad', 'hyd'],
+  ['mumbai', 'bombay'],
+  ['gurugram', 'gurgaon'],
+  ['delhi', 'new delhi'],
+  ['chennai', 'madras'],
+  ['kolkata', 'calcutta'],
+  ['pune', 'poona'],
+]
+
+function placeMatches(location, term) {
+  const text = location.toLowerCase()
+  if (text.includes(term)) return true
+  return PLACE_GROUPS.some(
+    (names) =>
+      names.some((name) => name === term || (term.length >= 3 && name.startsWith(term)))
+      && names.some((name) => text.includes(name)),
+  )
+}
+
+function anyTerm(haystack, value, match = (text, term) => text.toLowerCase().includes(term)) {
+  const terms = searchTerms(value)
+  if (!terms.length) return true
+  return terms.some((term) => match(haystack, term))
 }
 
 /** Stable portal id from the API. Display names such as "4 Day Week" are not compared. */
@@ -238,10 +267,11 @@ export function portalKeyOf(job, portals = []) {
   return match?.key || ''
 }
 
-/** Search, location, portal, and company tokens applied to the saved job list. */
+/** Search, location, portal, and company tokens applied to the saved job list. Commas mean "or". */
 export function matchesJob(job, { query = '', where = '', source = 'all', boards = '' }, portals = []) {
-  const haystack = `${job.role} ${job.company} ${job.location}`
-  if (!includes(haystack, query) || !includes(haystack, where)) return false
+  const queryText = `${job.role} ${job.company} ${(job.skills || []).join(' ')} ${job.location}`
+  if (!anyTerm(queryText, query)) return false
+  if (!anyTerm(job.location || '', where, placeMatches)) return false
   if (source !== 'all' && portalKeyOf(job, portals) !== source) return false
   const tokens = boards
     .split(',')

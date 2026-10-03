@@ -61,9 +61,9 @@ function App() {
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route element={<AppLayout theme={theme} onToggleTheme={toggleTheme} />}>
-            <Route path="jobs" element={<JobsPage />} />
             <Route element={<RequireAuth />}>
               <Route index element={<Navigate to="/dashboard" replace />} />
+              <Route path="jobs" element={<JobsPage />} />
               <Route path="dashboard" element={<Dashboard />} />
               <Route path="job-discovery" element={<JobDiscovery />} />
               <Route path="recommended-jobs" element={<RecommendedJobs />} />
