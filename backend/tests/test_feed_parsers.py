@@ -676,14 +676,12 @@ B.Tech Computer Science, Example University
         self.assertIn("UG: B.Tech / B.E. in Mechanical Engineering", bold["description"])
 
     def test_user_search_preferences_filter_jobs(self):
-        import tempfile
         from datetime import datetime, timedelta, timezone
-        from pathlib import Path
 
         import Server.server as server
 
-        original = server.PREFERENCES_DIR
-        server.PREFERENCES_DIR = Path(tempfile.mkdtemp()) / "preferences"
+        original = server._preferences_memory
+        server._preferences_memory = {}
         try:
             preferences = server.update_preferences("user-one", {
                 "experience": 3,
@@ -691,6 +689,7 @@ B.Tech Computer Science, Example University
                 "roles": ["DevOps", "ML"],
             })
             self.assertEqual(server.read_preferences("user-one"), preferences)
+            self.assertNotIn("geminiApiKey", preferences)
             now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             old = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
             jobs = [
@@ -722,8 +721,50 @@ B.Tech Computer Science, Example University
             ]}, broad)["jobs"]
             self.assertEqual(len(everything), 2)
             self.assertTrue(all(job["added on"] == recent for job in everything))
+            hidden = server.apply_preferences({"jobs": [
+                {"role": "Indeed role", "portalKey": "indeed", "experience": "", "skill": "", "added on": recent},
+                {"role": "LinkedIn role", "portalKey": "linkedin", "experience": "", "skill": "", "added on": recent},
+            ], "portals": [
+                {"key": "indeed", "label": "Indeed", "status": "idle"},
+                {"key": "linkedin", "label": "LinkedIn", "status": "idle"},
+            ]}, {**broad, "pausedPortals": ["indeed"]})
+            self.assertEqual([job["role"] for job in hidden["jobs"]], ["LinkedIn role"])
+            self.assertEqual(hidden["portals"][0]["status"], "paused")
+            self.assertEqual(server._empty_preferences()["pausedPortals"], ["instahyre", "naukri"])
         finally:
-            server.PREFERENCES_DIR = original
+            server._preferences_memory = original
+
+    def test_user_job_search_replaces_previous_results(self):
+        import Server.server as server
+
+        original = server._job_search_memory
+        server._job_search_memory = {}
+        try:
+            server.replace_user_jobs("user-one", {
+                "jobs": [
+                    {"role": "Old", "link": "https://jobs.example/old", "portal": "Naukri"},
+                    {"role": "Also old", "link": "https://jobs.example/old-2", "portal": "LinkedIn"},
+                ],
+                "loading": False,
+                "fetchedAt": "2026-10-01 00:00:00",
+            })
+            server.replace_user_jobs("user-one", {
+                "jobs": [{"role": "New", "link": "https://jobs.example/new", "portal": "Unstop"}],
+                "loading": False,
+                "fetchedAt": "2026-10-03 00:00:00",
+            })
+            stored = server.read_user_jobs("user-one")
+            self.assertEqual([job["role"] for job in stored["jobs"]], ["New"])
+            self.assertEqual(stored["fetchedAt"], "2026-10-03 00:00:00")
+            self.assertIsNone(server.read_user_jobs("user-two"))
+            parts = server._chunk_jobs([
+                {"role": str(index), "description": {"job description": "x" * 2000}}
+                for index in range(500)
+            ])
+            self.assertGreater(len(parts), 1)
+            self.assertEqual(sum(len(part) for part in parts), 500)
+        finally:
+            server._job_search_memory = original
 
 
 if __name__ == "__main__":

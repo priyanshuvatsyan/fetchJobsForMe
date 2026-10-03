@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
-import hashlib
 import io
 import json
 import logging
@@ -99,7 +98,9 @@ from connectors.WeWorkRemotely import WeWorkRemotely
 from connectors.WorkingNomads import WorkingNomads
 
 SLUG_SOURCES = {"greenhouse", "lever", "ashby"}
-PAUSED_SIDECAR_KEYS = {"instahyre"}
+# Used only when a user has not saved portal toggles. A saved list replaces this.
+DEFAULT_PAUSED_PORTALS = ("instahyre", "naukri")
+PAUSED_SIDECAR_KEYS = set()
 CONNECTORS = [
     Greenhouse,
     Lever,
@@ -137,7 +138,10 @@ _progress = {
     "error": "",
     "fetchedAt": "",
     "last_write": 0.0,
+    "last_cloud": 0.0,
     "stopped": False,
+    "owner": "",
+    "pausedPortals": [],
 }
 
 CREDITS = {
@@ -665,27 +669,57 @@ def _saved_collection(uid: str):
     )
 
 
-def _saved_doc_id(link: str) -> str:
-    return hashlib.sha256(link.encode("utf-8")).hexdigest()
+def _saved_document(uid: str):
+    """One document per user. Starring or removing a job replaces this document."""
+    return _saved_collection(uid).document("current")
+
+
+def _jobs_in_saved_document(payload: dict) -> list[dict]:
+    jobs = payload.get("jobs")
+    if isinstance(jobs, list):
+        return [item for item in jobs if isinstance(item, dict) and item.get("link")]
+    if payload.get("link"):
+        return [payload]
+    return []
+
+
+def _load_saved_jobs(uid: str) -> list[dict]:
+    """Read the one saved-jobs document. Older per-job documents are folded in, then deleted."""
+    document = _saved_document(uid)
+    current = document.get()
+    if current.exists:
+        jobs = _jobs_in_saved_document(current.to_dict() or {})
+    else:
+        jobs = []
+    legacy = []
+    if not current.exists:
+        for old in _saved_collection(uid).stream():
+            if old.id == "current":
+                continue
+            item = old.to_dict() or {}
+            if item.get("link"):
+                jobs.append(item)
+                legacy.append(old)
+    if legacy:
+        jobs.sort(key=lambda item: item.get("saved at") or "", reverse=True)
+        document.set({"jobs": jobs})
+        for old in legacy:
+            old.reference.delete()
+    return jobs
 
 
 def read_saved(uid: str) -> list[dict]:
-    """Saved jobs for one signed-in user. Each user has their own Firestore list."""
+    """Saved jobs for one signed-in user. The list lives in one replaceable document."""
     uid = str(uid or "").strip()
     if not uid:
         raise ValueError("sign in is required")
     if _saved_memory is not None:
         return [dict(item) for item in _saved_memory.get(uid, []) if item.get("link")]
     try:
-        documents = _saved_collection(uid).stream()
+        jobs = _load_saved_jobs(uid)
     except Exception as exc:
         event("saved", "error", f"read failed: {exc}")
         raise ValueError("could not read saved jobs") from exc
-    jobs = []
-    for document in documents:
-        item = document.to_dict() or {}
-        if isinstance(item, dict) and item.get("link"):
-            jobs.append(item)
     jobs.sort(key=lambda item: item.get("saved at") or "", reverse=True)
     return jobs
 
@@ -717,7 +751,6 @@ def save_job(uid: str, record: dict) -> dict:
     if not uid:
         raise ValueError("sign in is required")
     job = _saved_record(record)
-    job_id = _saved_doc_id(job["link"])
     with _saved_lock:
         if _saved_memory is not None:
             bucket = _saved_memory.setdefault(uid, [])
@@ -728,15 +761,16 @@ def save_job(uid: str, record: dict) -> dict:
             job["saved at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             bucket.insert(0, job)
         else:
-            document = _saved_collection(uid).document(job_id)
+            document = _saved_document(uid)
             try:
-                current = document.get()
-                if current.exists:
-                    stored = current.to_dict() or job
+                jobs = _load_saved_jobs(uid)
+                existing = next((item for item in jobs if item.get("link") == job["link"]), None)
+                if existing is not None:
                     event("saved", "info", f"already saved {job['role']} — {job['company']}")
-                    return stored
+                    return existing
                 job["saved at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                document.set(job)
+                jobs.insert(0, job)
+                document.set({"jobs": jobs})
             except Exception as exc:
                 event("saved", "error", f"save failed: {exc}")
                 raise ValueError("could not save job") from exc
@@ -756,12 +790,13 @@ def unsave_job(uid: str, link: str) -> bool:
                 return False
             _saved_memory[uid] = remaining
         else:
-            document = _saved_collection(uid).document(_saved_doc_id(link))
+            document = _saved_document(uid)
             try:
-                current = document.get()
-                if not current.exists:
+                jobs = _load_saved_jobs(uid)
+                remaining = [item for item in jobs if item.get("link") != link]
+                if len(remaining) == len(jobs):
                     return False
-                document.delete()
+                document.set({"jobs": remaining})
             except Exception as exc:
                 event("saved", "error", f"remove failed: {exc}")
                 raise ValueError("could not remove saved job") from exc
@@ -769,7 +804,9 @@ def unsave_job(uid: str, link: str) -> bool:
     return True
 
 
-PREFERENCES_DIR = JOBS_FILE.parent / "preferences"
+# Tests set this to a dict. The API leaves it empty and uses the same Firestore
+# document the Settings page already writes: users/{uid}/settings/preferences.
+_preferences_memory: dict | None = None
 _preferences_lock = threading.Lock()
 _POSTED_DAYS = {"today": 1, "yesterday": 2, "7days": 7, "15days": 15}
 _EXP_TEXT = (
@@ -781,15 +818,40 @@ _EXP_TEXT = (
 )
 
 
-def _preference_file(uid: str) -> Path:
-    safe = re.sub(r"[^A-Za-z0-9_-]", "", str(uid or ""))[:128]
-    if not safe:
-        raise ValueError("user id is required")
-    return PREFERENCES_DIR / f"{safe}.json"
+def _preferences_document(uid: str):
+    uid = str(uid or "").strip()
+    if not uid:
+        raise ValueError("sign in is required")
+    return (
+        get_firestore_client()
+        .collection("users")
+        .document(uid)
+        .collection("settings")
+        .document("preferences")
+    )
 
 
 def _empty_preferences() -> dict:
-    return {"experience": None, "posted": "all", "roles": [], "updatedAt": ""}
+    return {
+        "experience": None,
+        "posted": "all",
+        "roles": [],
+        "pausedPortals": list(DEFAULT_PAUSED_PORTALS),
+        "updatedAt": "",
+    }
+
+
+def _paused_portals(payload: dict | None) -> list[str]:
+    """Portal keys that should not be fetched. A missing list keeps Instahyre and Naukri paused."""
+    if not isinstance(payload, dict) or "pausedPortals" not in payload:
+        return list(DEFAULT_PAUSED_PORTALS)
+    raw = payload.get("pausedPortals")
+    if not isinstance(raw, list):
+        return list(DEFAULT_PAUSED_PORTALS)
+    known = set(BY_KEY)
+    return list(dict.fromkeys(
+        str(item).strip() for item in raw if str(item).strip() in known
+    ))
 
 
 def _experience_setting(value):
@@ -812,12 +874,9 @@ def _posted_setting(value: str) -> str:
     return posted
 
 
-def read_preferences(uid: str) -> dict:
+def _preferences_from_payload(payload: dict) -> dict:
+    """Search fields only. The Gemini key stays on the same document and is not returned."""
     result = _empty_preferences()
-    try:
-        payload = json.loads(_preference_file(uid).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
-        return result
     if not isinstance(payload, dict):
         return result
     try:
@@ -833,13 +892,33 @@ def read_preferences(uid: str) -> dict:
         result["roles"] = list(dict.fromkeys(
             clean(str(role))[:80] for role in roles if clean(str(role))
         ))[:20]
-    result["updatedAt"] = str(payload.get("updatedAt") or "")
+    updated = payload.get("updatedAt")
+    result["updatedAt"] = "" if updated is None else str(updated)
+    result["pausedPortals"] = _paused_portals(payload)
     return result
+
+
+def read_preferences(uid: str) -> dict:
+    uid = str(uid or "").strip()
+    if not uid:
+        return _empty_preferences()
+    if _preferences_memory is not None:
+        return _preferences_from_payload(_preferences_memory.get(uid) or {})
+    try:
+        snapshot = _preferences_document(uid).get()
+        payload = snapshot.to_dict() if snapshot.exists else {}
+    except Exception as exc:
+        event("preferences", "error", f"read failed: {exc}")
+        return _empty_preferences()
+    return _preferences_from_payload(payload if isinstance(payload, dict) else {})
 
 
 def update_preferences(uid: str, changes: dict) -> dict:
     if not isinstance(changes, dict):
         raise ValueError("preferences must be an object")
+    uid = str(uid or "").strip()
+    if not uid:
+        raise ValueError("sign in is required")
     experience = _experience_setting(changes.get("experience"))
     posted = _posted_setting(changes.get("posted"))
     roles = changes.get("roles")
@@ -851,10 +930,19 @@ def update_preferences(uid: str, changes: dict) -> dict:
         "roles": list(dict.fromkeys(
             clean(str(role))[:80] for role in roles if clean(str(role))
         ))[:20],
+        "pausedPortals": _paused_portals(changes),
         "updatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
     }
     with _preferences_lock:
-        _write_json(_preference_file(uid), preferences)
+        if _preferences_memory is not None:
+            _preferences_memory[uid] = dict(preferences)
+        else:
+            try:
+                # Merge keeps the Gemini key that Settings stores on this same document.
+                _preferences_document(uid).set(preferences, merge=True)
+            except Exception as exc:
+                event("preferences", "error", f"update failed: {exc}")
+                raise ValueError("could not update preferences") from exc
     event("preferences", "info", f"updated roles={len(preferences['roles'])}")
     return preferences
 
@@ -870,6 +958,7 @@ def _feed_preferences(preferences: dict) -> dict:
         "windowDays": preference_days(preferences),
         "experience": experience_cap(preferences.get("experience")),
         "roles": preferences.get("roles") or [],
+        "paused": list(preferences.get("pausedPortals") or []),
     }
 
 
@@ -886,6 +975,8 @@ def _minimum_experience(record: dict) -> int | None:
 
 
 def _matches_preferences(record: dict, preferences: dict) -> bool:
+    if (record.get("portalKey") or "") in set(preferences.get("pausedPortals") or []):
+        return False
     posted = str(record.get("added on") or "")
     days = preference_days(preferences)
     if posted and not within_days(posted, days):
@@ -906,6 +997,13 @@ def apply_preferences(payload: dict, preferences: dict) -> dict:
         if _matches_preferences(record, preferences)
     ]
     result["count"] = len(result["jobs"])
+    paused = set(preferences.get("pausedPortals") or [])
+    result["portals"] = [
+        {**portal, "status": "paused", "warnings": [], "error": ""}
+        if portal.get("key") in paused
+        else portal
+        for portal in result.get("portals") or []
+    ]
     result["preferences"] = preferences
     return result
 
@@ -1079,7 +1177,7 @@ def update_profile(uid: str, changes: dict) -> dict:
         profile.pop("completion", None)
 
         try:
-            _profile_document(uid).set(profile, merge=True)
+            _profile_document(uid).set(profile)
         except Exception as exc:
             event(
                 "profile",
@@ -1831,10 +1929,7 @@ def upload_resume(uid: str, payload: dict) -> dict:
         profile.pop("completion", None)
 
         try:
-            _profile_document(uid).set(
-                profile,
-                merge=True,
-            )
+            _profile_document(uid).set(profile)
         except Exception as exc:
             event(
                 "profile",
@@ -1898,17 +1993,17 @@ def with_note_key(note: dict) -> dict:
     return {**note, "portalKey": key}
 
 
-def _portal_catalog() -> list[dict]:
-    live = FEED_COORDINATOR.status()
-    main_running = bool(_progress.get("running"))
+def _portal_catalog(live: bool = True) -> list[dict]:
+    live_state = FEED_COORDINATOR.status() if live else {}
+    main_running = live and bool(_progress.get("running"))
     catalog = []
     for cls in CONNECTORS:
-        info = live.get(cls.key, {})
+        info = live_state.get(cls.key, {})
         if cls.key in PAUSED_SIDECAR_KEYS:
             status = "paused"
-        elif info.get("running"):
+        elif live and info.get("running"):
             status = "running"
-        elif getattr(cls, "persist", "") != "sidecar" and main_running:
+        elif live and getattr(cls, "persist", "") != "sidecar" and main_running:
             status = "running"
         elif info.get("error"):
             status = "error"
@@ -1956,6 +2051,7 @@ def _payload_from_progress(loading: bool, cached: bool = False) -> dict:
 
 
 def _remember(generation: int, connector, batch: list[Job], preferences: dict | None = None) -> None:
+    store_cloud = False
     with _jobs_lock:
         if generation != _progress["generation"]:
             return
@@ -1987,8 +2083,14 @@ def _remember(generation: int, connector, batch: list[Job], preferences: dict | 
             })
         now = time.monotonic()
         if batch and now - _progress.get("last_write", 0.0) >= 0.6:
-            write_jobs_file(_payload_from_progress(loading=not _progress.get("stopped")))
+            if not _progress.get("owner"):
+                write_jobs_file(_payload_from_progress(loading=not _progress.get("stopped")))
             _progress["last_write"] = now
+            store_cloud = bool(_progress.get("owner"))
+        else:
+            store_cloud = False
+    if store_cloud:
+        _store_owner_results(force=False)
 
 
 def _finish_fetch(generation: int, error: str = "") -> None:
@@ -2003,8 +2105,12 @@ def _finish_fetch(generation: int, error: str = "") -> None:
             event("jobs", "error", error)
         else:
             event("jobs", "info", f"company boards done jobs={len(_progress['jobs'])}")
+        owner = str(_progress.get("owner") or "")
         payload = _payload_from_progress(loading=False)
-        write_jobs_file(payload)
+        if not owner:
+            write_jobs_file(payload)
+    if owner:
+        _store_owner_results(force=not _feeds_running())
 
 
 def _portal_sources() -> list[type]:
@@ -2013,9 +2119,14 @@ def _portal_sources() -> list[type]:
 
 def _fetch_worker(country: str, generation: int, preferences: dict) -> None:
     event("jobs", "info", "company boards start")
+    paused = set(preferences.get("pausedPortals") or [])
+    sources = [cls for cls in _portal_sources() if cls.key not in paused]
+    if not sources:
+        _finish_fetch(generation)
+        return
     try:
         run_sources(
-            _portal_sources(),
+            sources,
             query="",
             where="",
             limit=0,
@@ -2031,7 +2142,7 @@ def _fetch_worker(country: str, generation: int, preferences: dict) -> None:
     _finish_fetch(generation)
 
 
-def _reset_progress() -> None:
+def _reset_progress(uid: str = "") -> None:
     _progress["generation"] += 1
     _progress["running"] = True
     _progress["jobs"] = []
@@ -2042,12 +2153,20 @@ def _reset_progress() -> None:
     _progress["error"] = ""
     _progress["fetchedAt"] = ""
     _progress["last_write"] = 0.0
+    _progress["last_cloud"] = 0.0
     _progress["stopped"] = False
+    _progress["owner"] = str(uid or "")
+    _progress["pausedPortals"] = []
     arm()
     FEED_COORDINATOR.suppressed = False
 
 
-def stop_fetches() -> dict:
+def stop_fetches(uid: str = "") -> dict:
+    owner = str(_progress.get("owner") or "")
+    uid = str(uid or "").strip()
+    if owner and uid != owner:
+        stored = read_user_jobs(uid) if uid else None
+        return _respond_saved(stored or _blank_search())
     cancel()
     from connectors.Naukri.Naukri import close_naukri_browser
 
@@ -2061,13 +2180,18 @@ def stop_fetches() -> dict:
         if note not in _progress["notes"]:
             _progress["notes"].append(note)
         payload = _payload_from_progress(loading=False)
-        write_jobs_file(payload)
-    return _respond(payload)
+        if not owner:
+            write_jobs_file(payload)
+    responded = _respond(payload)
+    if owner:
+        _store_owner_results(responded, force=True)
+    return responded
 
 
-def _start_main_fetch(country: str, refresh_sidecars: bool, preferences: dict) -> dict:
+def _start_main_fetch(country: str, refresh_sidecars: bool, preferences: dict, uid: str = "") -> dict:
     with _jobs_lock:
-        _reset_progress()
+        _reset_progress(uid)
+        _progress["pausedPortals"] = list(preferences.get("pausedPortals") or [])
         generation = _progress["generation"]
         payload = _payload_from_progress(loading=True)
     FEED_COORDINATOR.start_all(refresh_sidecars, _feed_preferences(preferences))
@@ -2080,7 +2204,251 @@ def _start_main_fetch(country: str, refresh_sidecars: bool, preferences: dict) -
     return payload
 
 
-def saved_or_live_jobs(country: str, refresh: bool, preferences: dict) -> dict:
+_JOB_PART_BYTES = 700_000
+_job_search_memory: dict | None = None
+_BUSY_NOTE = {
+    "portal": "fetch",
+    "portalKey": "",
+    "message": "Another search is still running. Showing your last results.",
+}
+
+
+def _feeds_running() -> bool:
+    return bool(FEED_COORDINATOR._running)
+
+
+def _blank_search() -> dict:
+    return {
+        "source": "all",
+        "query": "",
+        "where": "",
+        "limit": 0,
+        "count": 0,
+        "jobs": [],
+        "credits": [],
+        "notes": [],
+        "windowDays": WINDOW_DAYS,
+        "version": SNAPSHOT_VERSION,
+        "loading": False,
+        "cached": False,
+        "fetchedAt": "",
+        "error": "",
+        "stopped": False,
+    }
+
+
+def _chunk_jobs(jobs: list[dict]) -> list[list[dict]]:
+    """Split a result list into pieces that fit in one Firestore document."""
+    parts: list[list[dict]] = []
+    current: list[dict] = []
+    size = 2
+    for job in jobs:
+        extra = len(json.dumps(job, ensure_ascii=False).encode("utf-8")) + 1
+        if current and size + extra > _JOB_PART_BYTES:
+            parts.append(current)
+            current = []
+            size = 2
+        current.append(job)
+        size += extra
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _search_record(payload: dict) -> dict:
+    jobs = [dict(job) for job in payload.get("jobs") or [] if isinstance(job, dict)]
+    return {
+        "source": payload.get("source") or "all",
+        "query": payload.get("query") or "",
+        "where": payload.get("where") or "",
+        "limit": payload.get("limit") or 0,
+        "jobs": jobs,
+        "credits": list(payload.get("credits") or []),
+        "notes": [dict(note) for note in payload.get("notes") or [] if isinstance(note, dict)],
+        "windowDays": payload.get("windowDays") or WINDOW_DAYS,
+        "version": SNAPSHOT_VERSION,
+        "loading": bool(payload.get("loading")),
+        "cached": True,
+        "fetchedAt": str(payload.get("fetchedAt") or ""),
+        "error": str(payload.get("error") or ""),
+        "stopped": bool(payload.get("stopped")),
+        "count": len(jobs),
+    }
+
+
+def _job_search_collection(uid: str):
+    return (
+        get_firestore_client()
+        .collection("users")
+        .document(uid)
+        .collection("jobSearch")
+    )
+
+
+def replace_user_jobs(uid: str, payload: dict) -> None:
+    """Overwrite this user's search. Older part documents are deleted."""
+    uid = str(uid or "").strip()
+    if not uid:
+        return
+    record = _search_record(payload)
+    jobs = record.pop("jobs")
+    if _job_search_memory is not None:
+        _job_search_memory[uid] = {**record, "jobs": jobs}
+        return
+    parts = _chunk_jobs(jobs)
+    record["parts"] = len(parts)
+    collection = _job_search_collection(uid)
+    previous = 0
+    status = collection.document("status").get()
+    if status.exists:
+        previous = int((status.to_dict() or {}).get("parts") or 0)
+    collection.document("status").set(record)
+    for index, part in enumerate(parts):
+        collection.document(f"part-{index}").set({"jobs": part})
+    for index in range(len(parts), max(previous, len(parts))):
+        collection.document(f"part-{index}").delete()
+
+
+def read_user_jobs(uid: str) -> dict | None:
+    uid = str(uid or "").strip()
+    if not uid:
+        return None
+    if _job_search_memory is not None:
+        stored = _job_search_memory.get(uid)
+        if stored is None:
+            return None
+        return {**stored, "jobs": [dict(job) for job in stored.get("jobs") or []]}
+    try:
+        status = _job_search_collection(uid).document("status").get()
+    except Exception as exc:
+        event("jobs", "error", f"search read failed: {exc}")
+        return None
+    if not status.exists:
+        return None
+    record = status.to_dict() or {}
+    parts = int(record.pop("parts", 0) or 0)
+    jobs: list[dict] = []
+    collection = _job_search_collection(uid)
+    for index in range(parts):
+        part = collection.document(f"part-{index}").get()
+        chunk = (part.to_dict() or {}).get("jobs") if part.exists else []
+        if isinstance(chunk, list):
+            jobs.extend(item for item in chunk if isinstance(item, dict))
+    record["jobs"] = jobs
+    record["count"] = len(jobs)
+    record["cached"] = True
+    record["loading"] = False
+    return record
+
+
+def _respond_saved(payload: dict | None) -> dict:
+    """A stored search, without mixing in another user's live portal files."""
+    result = dict(payload or _blank_search())
+    jobs = [with_portal_key(record) for record in result.get("jobs") or [] if isinstance(record, dict)]
+    result["jobs"] = jobs
+    result["count"] = len(jobs)
+    result["notes"] = [with_note_key(note) for note in result.get("notes") or [] if isinstance(note, dict)]
+    result["loading"] = False
+    result["cached"] = True
+    result["portals"] = _portal_catalog(live=False)
+    result.setdefault("credits", [])
+    result.setdefault("windowDays", WINDOW_DAYS)
+    result.setdefault("version", SNAPSHOT_VERSION)
+    result.setdefault("fetchedAt", "")
+    result.setdefault("error", "")
+    result.setdefault("stopped", False)
+    result.setdefault("source", "all")
+    return result
+
+
+def _without_paused_jobs(payload: dict, paused: set[str]) -> dict:
+    """Keep another user's active portal out of this user's saved search."""
+    if not paused:
+        return payload
+    result = dict(payload)
+    result["jobs"] = [
+        job for job in result.get("jobs") or []
+        if (job.get("portalKey") or "") not in paused
+    ]
+    result["count"] = len(result["jobs"])
+    return result
+
+
+def _store_owner_results(payload: dict | None = None, force: bool = False) -> None:
+    uid = str(_progress.get("owner") or "")
+    if not uid:
+        return
+    now = time.monotonic()
+    if not force and now - float(_progress.get("last_cloud") or 0) < 15:
+        return
+    if payload is None:
+        loading = bool(_progress.get("running")) or _feeds_running()
+        payload = _respond(_payload_from_progress(loading=loading))
+    payload = _without_paused_jobs(payload, set(_progress.get("pausedPortals") or []))
+    jobs = payload.get("jobs") or []
+    if payload.get("loading") and not jobs:
+        return
+    try:
+        replace_user_jobs(uid, payload)
+    except Exception as exc:
+        event("jobs", "error", f"search save failed: {exc}")
+        return
+    _progress["last_cloud"] = now
+    if not payload.get("loading"):
+        event("jobs", "info", f"search saved jobs={len(jobs)}")
+
+
+def _after_portal(_key: str) -> None:
+    if not _progress.get("owner"):
+        return
+    boards = bool(_progress.get("running"))
+    _store_owner_results(force=not boards and not _feeds_running())
+
+
+FEED_COORDINATOR.after_portal = _after_portal
+
+
+def _user_search(country: str, refresh: bool, preferences: dict, uid: str) -> dict:
+    with _jobs_lock:
+        owner = str(_progress.get("owner") or "")
+        boards_running = bool(_progress.get("running"))
+        has_jobs = bool(_progress.get("jobs"))
+    running = boards_running or _feeds_running()
+    mine = owner == uid and (running or has_jobs)
+
+    if mine and refresh and running:
+        return _respond(_payload_from_progress(loading=True))
+    if mine and refresh and not running:
+        return _respond(_start_main_fetch(country, True, preferences, uid))
+    if mine:
+        payload = _respond(_payload_from_progress(loading=running))
+        _store_owner_results(payload, force=not running)
+        return payload
+
+    if running and owner != uid:
+        stored = read_user_jobs(uid) or _blank_search()
+        nothing_saved = not stored.get("jobs") and not stored.get("fetchedAt")
+        if refresh or nothing_saved:
+            notes = list(stored.get("notes") or [])
+            if _BUSY_NOTE not in notes:
+                notes.append(dict(_BUSY_NOTE))
+            stored = {**stored, "notes": notes}
+        return _respond_saved(stored)
+
+    stored = read_user_jobs(uid)
+    if not refresh and stored is not None and _snapshot_current(stored):
+        return _respond_saved(stored)
+    return _respond(_start_main_fetch(country, bool(refresh), preferences, uid))
+
+
+def saved_or_live_jobs(country: str, refresh: bool, preferences: dict, uid: str = "") -> dict:
+    uid = str(uid or "").strip()
+    if uid:
+        return _user_search(country, refresh, preferences, uid)
+    if _progress.get("owner"):
+        saved = dict(read_jobs_file() or _blank_search())
+        saved["jobs"] = list(saved.get("jobs") or [])
+        return _respond_saved(saved)
     if refresh:
         payload = _start_main_fetch(country, True, preferences)
         return _respond(payload)
@@ -2133,7 +2501,16 @@ def _current_view() -> dict:
 
 
 def jobs_summary(uid: str = "") -> dict:
-    view = _current_view()
+    uid = str(uid or "").strip()
+    owner = str(_progress.get("owner") or "")
+    live = bool(_progress.get("running") or _progress.get("jobs") or _feeds_running())
+    if uid and owner == uid and live:
+        view = _current_view()
+    elif uid:
+        stored = read_user_jobs(uid)
+        view = _respond_saved(stored if stored is not None else _blank_search())
+    else:
+        view = _current_view()
     counts: dict[str, int] = {}
     new_today = 0
     for record in view.get("jobs") or []:
@@ -2186,7 +2563,12 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             return
         if route.path == "/api/jobs/stop":
             event("jobs", "info", "stop requested")
-            self._send_json(200, stop_fetches())
+            uid = ""
+            try:
+                uid = uid_from_authorization(self.headers.get("Authorization"))
+            except (ValueError, RuntimeError, FileNotFoundError):
+                uid = ""
+            self._send_json(200, stop_fetches(uid))
             return
         if route.path == "/api/portals":
             self._send_json(200, {"portals": _portal_catalog()})
@@ -2231,9 +2613,8 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"profile": profile})
             return
         if route.path == "/api/preferences":
-            uid = (params.get("uid") or [""])[0].strip()
+            uid = self._user_id("preferences")
             if not uid:
-                self._send_json(400, {"error": "uid is required"})
                 return
             self._send_json(200, {"preferences": read_preferences(uid)})
             return
@@ -2243,13 +2624,18 @@ class JobsApiHandler(BaseHTTPRequestHandler):
 
         first = lambda name, fallback="": (params.get(name) or [fallback])[0].strip()
         refresh = first("refresh", "").casefold() in {"1", "true", "yes"}
-        uid = first("uid")
+        uid = ""
+        try:
+            uid = uid_from_authorization(self.headers.get("Authorization"))
+        except (ValueError, RuntimeError, FileNotFoundError):
+            uid = ""
         preferences = read_preferences(uid) if uid else _empty_preferences()
         try:
             payload = saved_or_live_jobs(
                 country=first("country", self.country) or self.country,
                 refresh=refresh,
                 preferences=preferences,
+                uid=uid,
             )
             payload = apply_preferences(payload, preferences)
         except SystemExit as exc:
@@ -2352,7 +2738,9 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         if body is None:
             return
         if path == "/api/preferences":
-            uid = (parse_qs(route.query).get("uid") or [""])[0].strip()
+            uid = self._user_id("preferences")
+            if not uid:
+                return
             try:
                 preferences = update_preferences(
                     uid,
