@@ -1,7 +1,30 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import WorkspacePage from '../../components/WorkspacePage'
-import usePreferences from '../../hooks/usePreferences'
+import usePreferences, { DEFAULT_PAUSED_PORTALS } from '../../hooks/usePreferences'
+import { getJson } from '../../api/client'
 import './Settings.css'
+
+const PORTALS = [
+  ['greenhouse', 'Greenhouse'],
+  ['lever', 'Lever'],
+  ['ashby', 'Ashby'],
+  ['remotive', 'Remotive'],
+  ['remoteok', 'RemoteOK'],
+  ['arbeitnow', 'Arbeitnow'],
+  ['adzuna', 'Adzuna'],
+  ['linkedin', 'LinkedIn'],
+  ['unstop', 'Unstop'],
+  ['shine', 'Shine'],
+  ['indeed', 'Indeed'],
+  ['naukri', 'Naukri'],
+  ['instahyre', 'Instahyre'],
+  ['himalayas', 'Himalayas'],
+  ['jobicy', 'Jobicy'],
+  ['themuse', 'The Muse'],
+  ['workingnomads', 'Working Nomads'],
+  ['fourdayweek', '4 Day Week'],
+  ['weworkremotely', 'We Work Remotely'],
+]
 
 const EXPERIENCE = [
   ['all', 'Select', 'All experience levels'],
@@ -39,8 +62,7 @@ function maskApiKey(key) {
   return `${key.slice(0, 4)}••••••••${key.slice(-4)}`
 }
 
-function SearchPreferences() {
-  const { preferences, status, error, save } = usePreferences()
+function SearchPreferences({ preferences, status, error, save }) {
   const [editing, setEditing] = useState(false)
   const [showKey, setShowKey] = useState(false)
   const [draft, setDraft] = useState(null)
@@ -244,17 +266,85 @@ function SearchPreferences() {
   )
 }
 
+function PortalPreferences({ preferences, status, error, save }) {
+  const [portals, setPortals] = useState(PORTALS.map(([key, label]) => ({ key, label })))
+  const paused = new Set(
+    Array.isArray(preferences?.pausedPortals) ? preferences.pausedPortals : DEFAULT_PAUSED_PORTALS,
+  )
+
+  useEffect(() => {
+    const controller = new AbortController()
+    getJson('/api/portals', { signal: controller.signal })
+      .then((payload) => {
+        const live = (payload.portals || [])
+          .filter((portal) => portal.key && portal.label)
+          .map((portal) => ({ key: portal.key, label: portal.label }))
+        if (live.length) setPortals(live)
+      })
+      .catch((cause) => {
+        if (cause.name !== 'AbortError') setPortals(PORTALS.map(([key, label]) => ({ key, label })))
+      })
+    return () => controller.abort()
+  }, [])
+
+  const toggle = async (key) => {
+    const next = new Set(paused)
+    if (next.has(key)) next.delete(key)
+    else next.add(key)
+    await save({
+      ...preferences,
+      pausedPortals: [...next],
+    })
+  }
+
+  if (status === 'loading') return <p className="settings-muted">Loading portals…</p>
+
+  return (
+    <div className="portal-preferences">
+      <p>On fetches jobs from that portal. Off pauses it, the same way Instahyre and Naukri start paused.</p>
+      {error ? <p className="settings-error">{error.message}</p> : null}
+      <ul className="portal-toggle-list">
+        {portals.map((portal) => {
+          const active = !paused.has(portal.key)
+          return (
+            <li key={portal.key}>
+              <span title={portal.label}>{portal.label}</span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={active}
+                aria-label={`${portal.label} ${active ? 'active' : 'paused'}`}
+                className={`portal-switch${active ? ' is-on' : ''}`}
+                disabled={status === 'saving'}
+                onClick={() => toggle(portal.key)}
+              >
+                <span />
+              </button>
+            </li>
+          )
+        })}
+      </ul>
+    </div>
+  )
+}
+
 export default function Settings() {
+  const preferencesApi = usePreferences()
   return (
     <WorkspacePage
       eyebrow="WORKSPACE PREFERENCES"
       title="Settings"
-      description="Manage your API credentials and job-search criteria."
+      description="Manage your API credentials, job-search criteria, and portals."
       sections={[
         {
           title: 'Job Search & API Preferences',
           description: 'Configure API key, role keywords, and experience filters.',
-          content: <SearchPreferences />,
+          content: <SearchPreferences {...preferencesApi} />,
+        },
+        {
+          title: 'Preferred job portals',
+          description: 'Choose which portals are included the next time jobs are fetched.',
+          content: <PortalPreferences {...preferencesApi} />,
         },
       ]}
     />

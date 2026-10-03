@@ -329,6 +329,7 @@ class FeedCoordinator:
         self._settings: dict[str, dict] = {}
         self._announced: set[str] = set()
         self.suppressed = False
+        self.after_portal = None
 
     def start_all(self, refresh: bool, preferences: dict | None = None) -> None:
         for key in self.connectors:
@@ -338,7 +339,9 @@ class FeedCoordinator:
         connector_class = self.connectors.get(key)
         if connector_class is None:
             return
-        if key in self.paused:
+        run_paused = set(self.paused)
+        run_paused.update(str(item) for item in (preferences or {}).get("paused") or [])
+        if key in run_paused:
             with self._lock:
                 announce = key not in self._announced
                 self._announced.add(key)
@@ -409,6 +412,12 @@ class FeedCoordinator:
             with self._lock:
                 if self._run_tokens.get(key) == run_token:
                     self._running.discard(key)
+            callback = self.after_portal
+            if callback is not None:
+                try:
+                    callback(key)
+                except Exception as exc:
+                    _event(key, "error", f"could not store results: {exc}")
 
     def status(self) -> dict[str, dict]:
         """Live portal state keyed by the same id the jobs and logs use."""

@@ -40,11 +40,17 @@ export async function savePreferences(preferences, signal) {
     geminiApiKey: resolvedApiKey,
     updatedAt: serverTimestamp(),
   }
+  if (Array.isArray(preferences?.pausedPortals)) {
+    payload.pausedPortals = preferences.pausedPortals
+  }
 
   await setDoc(ref, payload, { merge: true })
 
   return {
     ...payload,
+    apiKey: resolvedApiKey,
+    geminiApiKey: resolvedApiKey,
+    pausedPortals: payload.pausedPortals,
     updatedAt: new Date().toISOString(),
   }
 }
