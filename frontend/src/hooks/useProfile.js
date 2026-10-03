@@ -18,7 +18,7 @@ const EMPTY = {
   portfolio: '',
   workAuthorization: '',
   education: '',
-  experienceHistory: '',
+  experienceHistory: [],
   skills: [],
   targetRoles: [],
   preferredLocations: [],

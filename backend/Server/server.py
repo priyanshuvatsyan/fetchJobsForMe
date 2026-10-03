@@ -919,7 +919,7 @@ _PROFILE_TEXT_FIELDS = (
     "fullName", "email", "phone", "headline", "summary", "currentTitle",
     "currentCompany", "totalExperience", "noticePeriod", "expectedSalary",
     "salaryCurrency", "linkedin", "github", "portfolio", "workAuthorization",
-    "education", "experienceHistory",
+    "education",
 )
 _PROFILE_LIST_FIELDS = (
     "skills", "targetRoles", "preferredLocations", "workModes", "employmentTypes",
@@ -1015,6 +1015,11 @@ def read_profile(uid: str) -> dict:
     if isinstance(resume, dict):
         profile["resume"] = resume
 
+    profile["experienceHistory"] = _normalize_jobs(
+        payload.get("experienceHistory"),
+        profile.get("currentTitle", ""),
+        profile.get("currentCompany", ""),
+    )
     profile["updatedAt"] = str(payload.get("updatedAt") or "")
     profile["completion"] = _profile_completion(profile)
 
@@ -1054,6 +1059,14 @@ def update_profile(uid: str, changes: dict) -> dict:
                     if str(item).strip()
                 )
             )[:100]
+
+        if "experienceHistory" in changes:
+            jobs = _normalize_jobs(changes.get("experienceHistory"))
+            profile["experienceHistory"] = jobs
+            if jobs and jobs[0].get("title"):
+                profile["currentTitle"] = jobs[0]["title"]
+            if jobs and jobs[0].get("company"):
+                profile["currentCompany"] = jobs[0]["company"]
 
         for field in _PROFILE_BOOL_FIELDS:
             if field in changes:
@@ -1436,6 +1449,145 @@ def _extract_current_employment(
             break
 
     return title[:150], company[:150]
+
+
+_MONTH = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
+_YEAR = r"(?:19|20)\d{2}"
+_DATE_POINT = rf"(?:{_MONTH}\s+{_YEAR}|{_YEAR}|(?:0?[1-9]|1[0-2])/{_YEAR})"
+_DATE_RANGE = re.compile(
+    rf"(?P<start>{_DATE_POINT})\s*(?:-|–|—|to)\s*(?P<end>{_DATE_POINT}|present|current|now)",
+    re.I,
+)
+
+
+def _clean_job(item: dict) -> dict:
+    end = str(item.get("endDate") or "").strip()
+    if end.casefold() in {"present", "current", "now"}:
+        end = "Present"
+    return {
+        "title": str(item.get("title") or "").strip()[:150],
+        "company": str(item.get("company") or "").strip()[:150],
+        "startDate": str(item.get("startDate") or "").strip()[:40],
+        "endDate": end[:40],
+        "location": str(item.get("location") or "").strip()[:80],
+        "description": str(item.get("description") or "").strip()[:4000],
+    }
+
+
+def _job_has_content(job: dict) -> bool:
+    return any(job.get(key) for key in ("title", "company", "startDate", "endDate", "location", "description"))
+
+
+def _normalize_jobs(value, title: str = "", company: str = "") -> list[dict]:
+    """One entry per role. A legacy paragraph becomes a single role."""
+    jobs = []
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                jobs.append(_clean_job(item))
+            elif str(item or "").strip():
+                jobs.append(_clean_job({"description": item}))
+    elif str(value or "").strip():
+        jobs.append(_clean_job({
+            "title": title,
+            "company": company,
+            "description": value,
+        }))
+    return [job for job in jobs if _job_has_content(job)][:12]
+
+
+def _is_bullet(line: str) -> bool:
+    return bool(re.match(r"^(?:[•*]|\-|–)\s+\S", line))
+
+
+def _role_company(line: str) -> tuple[str, str]:
+    """Title and company from one header, the way a portal role line is written."""
+    if line.endswith((".", "!", "?")) or len(line) > 90:
+        return "", ""
+    match = re.match(r"^(?P<title>.+?)\s*(?:—|–|\||\bat\b)\s*(?P<company>.+)$", line, re.I)
+    if match and not _DATE_RANGE.search(match.group("title")):
+        return match.group("title").strip(" ,"), match.group("company").split(",")[0].strip(" ,")
+    if "," in line and not _DATE_RANGE.search(line):
+        title, company = [part.strip() for part in line.split(",", 1)]
+        if title and company and len(title) <= 80 and len(company) <= 80:
+            return title, company.split(",")[0].strip(" ,")
+    return "", ""
+
+
+def _parse_jobs(experience_text: str) -> list[dict]:
+    """Split a resume experience section into separate roles."""
+    lines = [re.sub(r"\s+", " ", line).strip() for line in (experience_text or "").splitlines() if line.strip()]
+    jobs: list[dict] = []
+    current = None
+    notes: list[str] = []
+
+    def flush() -> None:
+        nonlocal current, notes
+        if current is None:
+            return
+        current["description"] = "\n".join(note for note in notes if note).strip()[:4000]
+        if _job_has_content(current):
+            jobs.append(_clean_job(current))
+        current = None
+        notes = []
+
+    def begin(title: str = "", company: str = "") -> None:
+        nonlocal current, notes
+        flush()
+        current = {
+            "title": title,
+            "company": company,
+            "startDate": "",
+            "endDate": "",
+            "location": "",
+            "description": "",
+        }
+        notes = []
+
+    for index, line in enumerate(lines):
+        if _is_bullet(line):
+            if current is None:
+                begin()
+            notes.append(re.sub(r"^(?:[•*]|\-|–)\s+", "", line).strip())
+            continue
+        date = _DATE_RANGE.search(line)
+        title, company = _role_company(line)
+        upcoming = lines[index + 1] if index + 1 < len(lines) else ""
+        followed_by_date = bool(upcoming) and not _is_bullet(upcoming) and bool(_DATE_RANGE.search(upcoming))
+        if date and not title and len(line) <= 60:
+            if current is None:
+                begin()
+            current["startDate"] = date.group("start")
+            end = date.group("end")
+            current["endDate"] = "Present" if end.casefold() in {"present", "current", "now"} else end
+            continue
+        if title or followed_by_date:
+            begin(title or line, company)
+            if date:
+                current["startDate"] = date.group("start")
+                end = date.group("end")
+                current["endDate"] = "Present" if end.casefold() in {"present", "current", "now"} else end
+            continue
+        if current is None:
+            begin(line)
+            continue
+        if not current["company"] and not current["startDate"]:
+            current["company"] = line[:150]
+            continue
+        if (
+            not current["location"]
+            and not notes
+            and len(line) <= 40
+            and len(line.split()) <= 4
+            and not line.endswith(".")
+        ):
+            current["location"] = line
+            continue
+        notes.append(line)
+    flush()
+    return jobs[:12]
+
+
 def _extract_total_experience(
     text: str,
     summary: str,
@@ -1531,9 +1683,11 @@ def parse_resume(text: str) -> dict:
     experience = _extract_section(lines, "experience")
     education = _extract_section(lines, "education")
 
-    current_title, current_company = _extract_current_employment(
-        experience
-    )
+    jobs = _parse_jobs(experience)
+    current_title = jobs[0]["title"] if jobs else ""
+    current_company = jobs[0]["company"] if jobs else ""
+    if not current_title and not current_company:
+        current_title, current_company = _extract_current_employment(experience)
 
     skills = _extract_skills(
         skills_text,
@@ -1585,7 +1739,7 @@ def parse_resume(text: str) -> dict:
         "github": github,
         "portfolio": portfolio,
         "education": education,
-        "experienceHistory": experience,
+        "experienceHistory": jobs,
     }
 
 

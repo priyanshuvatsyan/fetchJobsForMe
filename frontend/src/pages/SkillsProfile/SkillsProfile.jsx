@@ -7,6 +7,21 @@ import './SkillsProfile.css'
 const WORK_MODES = ['Remote', 'Hybrid', 'On-site']
 const EMPLOYMENT_TYPES = ['Full-time', 'Part-time', 'Contract', 'Internship']
 
+function emptyJob() {
+  return { title: '', company: '', startDate: '', endDate: '', location: '', description: '' }
+}
+
+function normalizeJobs(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => ({
+      ...emptyJob(),
+      ...(item && typeof item === 'object' ? item : { description: String(item || '') }),
+    }))
+  }
+  if (typeof value === 'string' && value.trim()) return [{ ...emptyJob(), description: value }]
+  return []
+}
+
 function cloneProfile(profile) {
   return {
     ...profile,
@@ -15,6 +30,7 @@ function cloneProfile(profile) {
     preferredLocations: [...profile.preferredLocations],
     workModes: [...profile.workModes],
     employmentTypes: [...profile.employmentTypes],
+    experienceHistory: normalizeJobs(profile.experienceHistory),
   }
 }
 
@@ -161,6 +177,42 @@ function Prose({ value, empty }) {
   return <p className="profile-prose">{value}</p>
 }
 
+function jobDates(job) {
+  if (job.startDate && job.endDate) return `${job.startDate} – ${job.endDate}`
+  return job.startDate || job.endDate || ''
+}
+
+function JobList({ jobs, onChange }) {
+  const update = (index, next) => onChange(jobs.map((job, jobIndex) => (jobIndex === index ? next : job)))
+  return (
+    <div className="profile-jobs">
+      {jobs.map((job, index) => (
+        <div className="profile-job" key={index}>
+          <div className="profile-job-heading">
+            <strong>{job.title || job.company || `Role ${index + 1}`}</strong>
+            {jobs.length > 1 ? (
+              <button type="button" className="profile-cancel" onClick={() => onChange(jobs.filter((_, jobIndex) => jobIndex !== index))}>
+                Remove
+              </button>
+            ) : null}
+          </div>
+          <div className="profile-grid">
+            <TextField label="Role" value={job.title} onChange={(value) => update(index, { ...job, title: value })} />
+            <TextField label="Company" value={job.company} onChange={(value) => update(index, { ...job, company: value })} />
+            <TextField label="Start" value={job.startDate} onChange={(value) => update(index, { ...job, startDate: value })} placeholder="Jan 2022" />
+            <TextField label="End" value={job.endDate} onChange={(value) => update(index, { ...job, endDate: value })} placeholder="Present" />
+            <TextField wide label="Location" value={job.location} onChange={(value) => update(index, { ...job, location: value })} placeholder="Bengaluru" />
+            <AreaField label="What you did" rows={4} value={job.description} onChange={(value) => update(index, { ...job, description: value })} />
+          </div>
+        </div>
+      ))}
+      <button type="button" className="profile-add" onClick={() => onChange([...jobs, emptyJob()])}>
+        Add another role
+      </button>
+    </div>
+  )
+}
+
 function SectionActions({ saving, onCancel, onSave }) {
   return (
     <div className="profile-actions">
@@ -301,29 +353,38 @@ export default function SkillsProfile() {
             )}
           </ProfileSection>
 
-          <ProfileSection id="employment" title="Employment" description="Current role, notice period, and work history." editing={editing === 'employment'} onEdit={() => begin('employment')}>
+          <ProfileSection id="employment" title="Employment" description="Each role is listed separately, newest first." editing={editing === 'employment'} onEdit={() => begin('employment')}>
             {editing === 'employment' ? (
               <>
                 <div className="profile-grid">
-                  <TextField label="Current job title" value={form.currentTitle} onChange={(value) => setField('currentTitle', value)} />
-                  <TextField label="Current company" value={form.currentCompany} onChange={(value) => setField('currentCompany', value)} />
                   <TextField label="Total experience" value={form.totalExperience} onChange={(value) => setField('totalExperience', value)} placeholder="4 years" />
                   <TextField label="Notice period" value={form.noticePeriod} onChange={(value) => setField('noticePeriod', value)} placeholder="30 days" />
-                  <AreaField label="Work history" rows={8} value={form.experienceHistory} onChange={(value) => setField('experienceHistory', value)} hint="Company, title, dates, and what you delivered." />
                 </div>
+                <JobList
+                  jobs={form.experienceHistory.length ? form.experienceHistory : [emptyJob()]}
+                  onChange={(jobs) => setDraft((current) => ({
+                    ...current,
+                    experienceHistory: jobs,
+                    currentTitle: jobs[0]?.title || '',
+                    currentCompany: jobs[0]?.company || '',
+                    headline: current.headline || jobs[0]?.title || '',
+                  }))}
+                />
                 <SectionActions saving={saving} onCancel={cancel} onSave={commit} />
               </>
             ) : (
               <>
-                <div className="profile-role">
-                  <strong>{profile.currentTitle || 'Current role not added'}</strong>
-                  <span>{profile.currentCompany || 'Company not added'}</span>
-                </div>
                 <Facts items={[
                   { label: 'Total experience', value: profile.totalExperience },
                   { label: 'Notice period', value: profile.noticePeriod },
                 ]} />
-                <Prose value={profile.experienceHistory} empty="Add the companies and roles from your work history." />
+                {normalizeJobs(profile.experienceHistory).length ? normalizeJobs(profile.experienceHistory).map((job, index) => (
+                  <article className="profile-role" key={`${job.company}-${job.title}-${index}`}>
+                    <strong>{job.title || 'Role not added'}</strong>
+                    <span>{[job.company, jobDates(job), job.location].filter(Boolean).join(' · ') || 'Company not added'}</span>
+                    {job.description ? <p className="profile-prose">{job.description}</p> : null}
+                  </article>
+                )) : <p className="profile-empty">Add the companies and roles from your work history.</p>}
               </>
             )}
           </ProfileSection>
@@ -356,7 +417,7 @@ export default function SkillsProfile() {
                       {['INR', 'USD', 'EUR', 'GBP'].map((currency) => <option key={currency}>{currency}</option>)}
                     </select>
                   </label>
-                  <TextField wide label="Work authorization" value={form.workAuthorization} onChange={(value) => setField('workAuthorization', value)} />
+                  <TextField label="Experience" value={form.totalExperience} onChange={(value) => setField('totalExperience', value)} placeholder="4 years" />
                   <div className="profile-switches is-wide">
                     <ToggleTile title="Open to work" detail="Use this profile for recommendations." selected={form.openToWork} onChange={(value) => setField('openToWork', value)} />
                     <ToggleTile title="Willing to relocate" detail="Include roles outside preferred locations." selected={form.willingToRelocate} onChange={(value) => setField('willingToRelocate', value)} />
@@ -368,7 +429,7 @@ export default function SkillsProfile() {
               <>
                 <Facts items={[
                   { label: 'Expected salary', value: profile.expectedSalary ? `${profile.salaryCurrency} ${profile.expectedSalary}` : '' },
-                  { label: 'Work authorization', value: profile.workAuthorization },
+                  { label: 'Experience', value: profile.totalExperience },
                   { label: 'Open to work', value: profile.openToWork ? 'Yes' : 'No' },
                   { label: 'Willing to relocate', value: profile.willingToRelocate ? 'Yes' : 'No' },
                 ]} />

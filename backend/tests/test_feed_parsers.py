@@ -333,7 +333,13 @@ Backend engineer with 5 years of experience building Python and FastAPI services
 
 EXPERIENCE
 Senior Backend Engineer, Acme
+Jan 2022 - Present
+Bengaluru
 Built REST APIs with PostgreSQL, Docker, Kubernetes and Kafka.
+
+Software Engineer | Example Labs
+2019 - 2022
+Built the billing API.
 
 EDUCATION
 B.Tech Computer Science, Example University
@@ -349,6 +355,12 @@ B.Tech Computer Science, Example University
             self.assertIn("Python", profile["skills"])
             self.assertIn("FastAPI", profile["skills"])
             self.assertEqual(profile["resume"]["filename"], "resume.txt")
+            roles = profile["experienceHistory"]
+            self.assertEqual([role["title"] for role in roles], ["Senior Backend Engineer", "Software Engineer"])
+            self.assertEqual(roles[0]["company"], "Acme")
+            self.assertEqual(roles[0]["endDate"], "Present")
+            self.assertEqual(roles[1]["company"], "Example Labs")
+            self.assertEqual(roles[1]["startDate"], "2019")
             updated = server.update_profile("user-one", {
                 "targetRoles": ["Backend Engineer"],
                 "preferredLocations": ["Bengaluru", "Remote"],
