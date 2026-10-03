@@ -28,12 +28,11 @@ from urllib.parse import parse_qs, urlparse
 from xml.etree import ElementTree
 import os
 
-
-
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
+from Server.firebase import get_firestore_client, uid_from_authorization
 from Server.gemini_service import get_user_gemini_client
 
 _LOGGER = logging.getLogger("fetchjobs")
@@ -67,7 +66,15 @@ def event(portal: str, level: str, message: str) -> None:
     _LOGGER.log(numeric, "[%s] %s", portal or "-", message)
 
 
-from Server.api import POSTED_WINDOW_DAYS, Job, clean, is_tech_role, keeps_india_hybrid_or_remote, within_days
+from Server.api import (
+    POSTED_WINDOW_DAYS,
+    Job,
+    apply_posting_facts,
+    clean,
+    is_tech_role,
+    keeps_india_hybrid_or_remote,
+    within_days,
+)
 from Server.control import arm, cancel, held
 from Server.feeds import FeedCoordinator
 from connectors.Adzuna import Adzuna
@@ -91,7 +98,9 @@ from connectors.WeWorkRemotely import WeWorkRemotely
 from connectors.WorkingNomads import WorkingNomads
 
 SLUG_SOURCES = {"greenhouse", "lever", "ashby"}
-PAUSED_SIDECAR_KEYS = {"instahyre"}
+# Used only when a user has not saved portal toggles. A saved list replaces this.
+DEFAULT_PAUSED_PORTALS = ("instahyre", "naukri")
+PAUSED_SIDECAR_KEYS = set()
 CONNECTORS = [
     Greenhouse,
     Lever,
@@ -129,7 +138,10 @@ _progress = {
     "error": "",
     "fetchedAt": "",
     "last_write": 0.0,
+    "last_cloud": 0.0,
     "stopped": False,
+    "owner": "",
+    "pausedPortals": [],
 }
 
 CREDITS = {
@@ -470,6 +482,7 @@ def sort_jobs(jobs: list[Job], specs: list[tuple[str, bool]]) -> list[Job]:
 
 
 def job_record(job: Job, include_portal: bool, portal_key: str = "") -> dict:
+    job = apply_posting_facts(job)
     record = {
         "company": job.company,
         "role": job.title,
@@ -481,6 +494,8 @@ def job_record(job: Job, include_portal: bool, portal_key: str = "") -> dict:
         "description": {
             "about company": job.about_company,
             "job description": job.job_description,
+            **({"posted by": job.posted_by} if job.posted_by else {}),
+            **({"email": job.poster_email} if job.poster_email else {}),
             **({"openings": job.openings} if job.openings else {}),
             **({"applicants": job.applicants} if job.applicants else {}),
         },
@@ -633,22 +648,85 @@ def write_jobs_file(payload: dict) -> None:
     _write_json(JOBS_FILE, payload)
 
 
-SAVED_FILE = JOBS_FILE.parent / "saved_jobs.json"
 _saved_lock = threading.Lock()
+# Tests set this to a dict. The API leaves it empty and uses Firestore.
+_saved_memory: dict | None = None
 _SAVED_FIELDS = (
     "portal", "portalKey", "company", "role", "experience",
     "skill", "salary", "added on", "location", "link", "apply",
 )
 
 
-def read_saved() -> list[dict]:
+def _saved_collection(uid: str):
+    uid = str(uid or "").strip()
+    if not uid:
+        raise ValueError("sign in is required")
+    return (
+        get_firestore_client()
+        .collection("users")
+        .document(uid)
+        .collection("savedJobs")
+    )
+
+
+def _saved_document(uid: str):
+    """One document per user. Starring or removing a job replaces this document."""
+    return _saved_collection(uid).document("saved_jobs")
+
+
+def _jobs_in_saved_document(payload: dict) -> list[dict]:
+    jobs = payload.get("jobs")
+    if isinstance(jobs, list):
+        return [item for item in jobs if isinstance(item, dict) and item.get("link")]
+    if payload.get("link"):
+        return [payload]
+    return []
+
+
+def _load_saved_jobs(uid: str) -> list[dict]:
+    """Read users/{uid}/savedJobs/saved_jobs. Older documents are folded in, then deleted."""
+    document = _saved_document(uid)
+    current = document.get()
+    legacy = []
+    if current.exists:
+        jobs = _jobs_in_saved_document(current.to_dict() or {})
+    else:
+        jobs = []
+        previous = _saved_collection(uid).document("current").get()
+        if previous.exists:
+            jobs = _jobs_in_saved_document(previous.to_dict() or {})
+            legacy.append(previous.reference)
+        else:
+            for old in _saved_collection(uid).stream():
+                if old.id in {"saved_jobs", "current"}:
+                    continue
+                item = old.to_dict() or {}
+                found = _jobs_in_saved_document(item)
+                if found:
+                    jobs.extend(found)
+                    legacy.append(old.reference)
+    if legacy:
+        jobs.sort(key=lambda item: item.get("saved at") or "", reverse=True)
+        document.set({"jobs": jobs})
+        for old in legacy:
+            old.delete()
+    return jobs
+
+
+def read_saved(uid: str) -> list[dict]:
+    """Saved jobs for one signed-in user. The list lives in one replaceable document."""
+    uid = str(uid or "").strip()
+    if not uid:
+        raise ValueError("sign in is required")
+    if _saved_memory is not None:
+        return [dict(item) for item in _saved_memory.get(uid, []) if item.get("link")]
     try:
-        payload = json.loads(SAVED_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    if not isinstance(payload, list):
-        return []
-    return [item for item in payload if isinstance(item, dict) and item.get("link")]
+        jobs = _load_saved_jobs(uid)
+    except Exception as exc:
+        event("saved", "error", f"read failed: {exc}")
+        raise ValueError("could not read saved jobs") from exc
+    jobs.sort(key=lambda item: item.get("saved at") or "", reverse=True)
+    return jobs
 
 
 def _saved_record(record: dict) -> dict:
@@ -666,38 +744,74 @@ def _saved_record(record: dict) -> dict:
         "about company": str(description.get("about company") or ""),
         "job description": str(description.get("job description") or ""),
     }
-    for field in ("openings", "applicants"):
+    for field in ("openings", "applicants", "posted by", "email"):
         value = str(description.get(field) or "").strip()
         if value:
             clean["description"][field] = value
     return with_portal_key(clean)
 
 
-def save_job(record: dict) -> dict:
+def save_job(uid: str, record: dict) -> dict:
+    uid = str(uid or "").strip()
+    if not uid:
+        raise ValueError("sign in is required")
     job = _saved_record(record)
     with _saved_lock:
-        saved = read_saved()
-        existing = next((item for item in saved if item["link"] == job["link"]), None)
-        if existing is not None:
-            return existing
-        job["saved at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        _write_json(SAVED_FILE, [job, *saved])
+        if _saved_memory is not None:
+            bucket = _saved_memory.setdefault(uid, [])
+            existing = next((item for item in bucket if item["link"] == job["link"]), None)
+            if existing is not None:
+                event("saved", "info", f"already saved {job['role']} — {job['company']}")
+                return dict(existing)
+            job["saved at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            bucket.insert(0, job)
+        else:
+            document = _saved_document(uid)
+            try:
+                jobs = _load_saved_jobs(uid)
+                existing = next((item for item in jobs if item.get("link") == job["link"]), None)
+                if existing is not None:
+                    event("saved", "info", f"already saved {job['role']} — {job['company']}")
+                    return existing
+                job["saved at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                jobs.insert(0, job)
+                document.set({"jobs": jobs})
+            except Exception as exc:
+                event("saved", "error", f"save failed: {exc}")
+                raise ValueError("could not save job") from exc
     event(job.get("portalKey") or "saved", "info", f"saved {job['role']} — {job['company']}")
     return job
 
 
-def unsave_job(link: str) -> bool:
+def unsave_job(uid: str, link: str) -> bool:
+    uid = str(uid or "").strip()
+    if not uid:
+        raise ValueError("sign in is required")
     with _saved_lock:
-        saved = read_saved()
-        remaining = [item for item in saved if item["link"] != link]
-        if len(remaining) == len(saved):
-            return False
-        _write_json(SAVED_FILE, remaining)
+        if _saved_memory is not None:
+            bucket = _saved_memory.get(uid, [])
+            remaining = [item for item in bucket if item["link"] != link]
+            if len(remaining) == len(bucket):
+                return False
+            _saved_memory[uid] = remaining
+        else:
+            document = _saved_document(uid)
+            try:
+                jobs = _load_saved_jobs(uid)
+                remaining = [item for item in jobs if item.get("link") != link]
+                if len(remaining) == len(jobs):
+                    return False
+                document.set({"jobs": remaining})
+            except Exception as exc:
+                event("saved", "error", f"remove failed: {exc}")
+                raise ValueError("could not remove saved job") from exc
     event("saved", "info", f"removed {link}")
     return True
 
 
-PREFERENCES_DIR = JOBS_FILE.parent / "preferences"
+# Tests set this to a dict. The API leaves it empty and uses the same Firestore
+# document the Settings page already writes: users/{uid}/settings/preferences.
+_preferences_memory: dict | None = None
 _preferences_lock = threading.Lock()
 _POSTED_DAYS = {"today": 1, "yesterday": 2, "7days": 7, "15days": 15}
 _EXP_TEXT = (
@@ -709,15 +823,40 @@ _EXP_TEXT = (
 )
 
 
-def _preference_file(uid: str) -> Path:
-    safe = re.sub(r"[^A-Za-z0-9_-]", "", str(uid or ""))[:128]
-    if not safe:
-        raise ValueError("user id is required")
-    return PREFERENCES_DIR / f"{safe}.json"
+def _preferences_document(uid: str):
+    uid = str(uid or "").strip()
+    if not uid:
+        raise ValueError("sign in is required")
+    return (
+        get_firestore_client()
+        .collection("users")
+        .document(uid)
+        .collection("settings")
+        .document("preferences")
+    )
 
 
 def _empty_preferences() -> dict:
-    return {"experience": None, "posted": "all", "roles": [], "updatedAt": ""}
+    return {
+        "experience": None,
+        "posted": "all",
+        "roles": [],
+        "pausedPortals": list(DEFAULT_PAUSED_PORTALS),
+        "updatedAt": "",
+    }
+
+
+def _paused_portals(payload: dict | None) -> list[str]:
+    """Portal keys that should not be fetched. A missing list keeps Instahyre and Naukri paused."""
+    if not isinstance(payload, dict) or "pausedPortals" not in payload:
+        return list(DEFAULT_PAUSED_PORTALS)
+    raw = payload.get("pausedPortals")
+    if not isinstance(raw, list):
+        return list(DEFAULT_PAUSED_PORTALS)
+    known = set(BY_KEY)
+    return list(dict.fromkeys(
+        str(item).strip() for item in raw if str(item).strip() in known
+    ))
 
 
 def _experience_setting(value):
@@ -740,12 +879,9 @@ def _posted_setting(value: str) -> str:
     return posted
 
 
-def read_preferences(uid: str) -> dict:
+def _preferences_from_payload(payload: dict) -> dict:
+    """Search fields only. The Gemini key stays on the same document and is not returned."""
     result = _empty_preferences()
-    try:
-        payload = json.loads(_preference_file(uid).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
-        return result
     if not isinstance(payload, dict):
         return result
     try:
@@ -761,13 +897,33 @@ def read_preferences(uid: str) -> dict:
         result["roles"] = list(dict.fromkeys(
             clean(str(role))[:80] for role in roles if clean(str(role))
         ))[:20]
-    result["updatedAt"] = str(payload.get("updatedAt") or "")
+    updated = payload.get("updatedAt")
+    result["updatedAt"] = "" if updated is None else str(updated)
+    result["pausedPortals"] = _paused_portals(payload)
     return result
+
+
+def read_preferences(uid: str) -> dict:
+    uid = str(uid or "").strip()
+    if not uid:
+        return _empty_preferences()
+    if _preferences_memory is not None:
+        return _preferences_from_payload(_preferences_memory.get(uid) or {})
+    try:
+        snapshot = _preferences_document(uid).get()
+        payload = snapshot.to_dict() if snapshot.exists else {}
+    except Exception as exc:
+        event("preferences", "error", f"read failed: {exc}")
+        return _empty_preferences()
+    return _preferences_from_payload(payload if isinstance(payload, dict) else {})
 
 
 def update_preferences(uid: str, changes: dict) -> dict:
     if not isinstance(changes, dict):
         raise ValueError("preferences must be an object")
+    uid = str(uid or "").strip()
+    if not uid:
+        raise ValueError("sign in is required")
     experience = _experience_setting(changes.get("experience"))
     posted = _posted_setting(changes.get("posted"))
     roles = changes.get("roles")
@@ -779,11 +935,20 @@ def update_preferences(uid: str, changes: dict) -> dict:
         "roles": list(dict.fromkeys(
             clean(str(role))[:80] for role in roles if clean(str(role))
         ))[:20],
+        "pausedPortals": _paused_portals(changes),
         "updatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
     }
     with _preferences_lock:
-        _write_json(_preference_file(uid), preferences)
-    event("preferences", "info", f"updated uid={uid[:8]} roles={len(preferences['roles'])}")
+        if _preferences_memory is not None:
+            _preferences_memory[uid] = dict(preferences)
+        else:
+            try:
+                # Merge keeps the Gemini key that Settings stores on this same document.
+                _preferences_document(uid).set(preferences, merge=True)
+            except Exception as exc:
+                event("preferences", "error", f"update failed: {exc}")
+                raise ValueError("could not update preferences") from exc
+    event("preferences", "info", f"updated roles={len(preferences['roles'])}")
     return preferences
 
 
@@ -798,6 +963,7 @@ def _feed_preferences(preferences: dict) -> dict:
         "windowDays": preference_days(preferences),
         "experience": experience_cap(preferences.get("experience")),
         "roles": preferences.get("roles") or [],
+        "paused": list(preferences.get("pausedPortals") or []),
     }
 
 
@@ -814,6 +980,8 @@ def _minimum_experience(record: dict) -> int | None:
 
 
 def _matches_preferences(record: dict, preferences: dict) -> bool:
+    if (record.get("portalKey") or "") in set(preferences.get("pausedPortals") or []):
+        return False
     posted = str(record.get("added on") or "")
     days = preference_days(preferences)
     if posted and not within_days(posted, days):
@@ -834,19 +1002,27 @@ def apply_preferences(payload: dict, preferences: dict) -> dict:
         if _matches_preferences(record, preferences)
     ]
     result["count"] = len(result["jobs"])
+    paused = set(preferences.get("pausedPortals") or [])
+    result["portals"] = [
+        {**portal, "status": "paused", "warnings": [], "error": ""}
+        if portal.get("key") in paused
+        else portal
+        for portal in result.get("portals") or []
+    ]
     result["preferences"] = preferences
     return result
 
 
-PROFILE_FILE = JOBS_FILE.parent / "profile.json"
-RESUME_DIR = JOBS_FILE.parent / "resume"
+# Candidate profile and resume. The profile is deliberately provider-neutral so
+# recommendations, applications, and future agents can all consume one schema.
+
 MAX_RESUME_BYTES = 8 * 1024 * 1024
 _profile_lock = threading.Lock()
 _PROFILE_TEXT_FIELDS = (
     "fullName", "email", "phone", "headline", "summary", "currentTitle",
     "currentCompany", "totalExperience", "noticePeriod", "expectedSalary",
     "salaryCurrency", "linkedin", "github", "portfolio", "workAuthorization",
-    "education", "experienceHistory",
+    "education",
 )
 _PROFILE_LIST_FIELDS = (
     "skills", "targetRoles", "preferredLocations", "workModes", "employmentTypes",
@@ -886,231 +1062,901 @@ def _profile_completion(profile: dict) -> int:
     complete = sum(bool(profile.get(field)) for field in important)
     return round(complete * 100 / len(important))
 
+def _profile_document(uid: str):
+    uid = str(uid or "").strip()
 
-def read_profile() -> dict:
+    if not uid:
+        raise ValueError("authenticated user UID is required")
+
+    return (
+        get_firestore_client()
+        .collection("users")
+        .document(uid)
+        .collection("jobProfile")
+        .document("default")
+    )
+
+def read_profile(uid: str) -> dict:
     profile = _empty_profile()
+
     try:
-        payload = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        snapshot = _profile_document(uid).get()
+        payload = snapshot.to_dict() if snapshot.exists else {}
+    except Exception as exc:
+        event(
+            "profile",
+            "error",
+            f"profile read failed: {exc}",
+        )
+        raise ValueError("could not read profile") from exc
+
+    if not isinstance(payload, dict):
         payload = {}
-    if isinstance(payload, dict):
-        for field in _PROFILE_TEXT_FIELDS:
-            if isinstance(payload.get(field), str):
-                profile[field] = payload[field]
-        for field in _PROFILE_LIST_FIELDS:
-            if isinstance(payload.get(field), list):
-                profile[field] = [str(item).strip() for item in payload[field] if str(item).strip()]
-        for field in _PROFILE_BOOL_FIELDS:
-            profile[field] = bool(payload.get(field))
-        if isinstance(payload.get("resume"), dict):
-            profile["resume"] = payload["resume"]
-        profile["updatedAt"] = str(payload.get("updatedAt") or "")
+
+    for field in _PROFILE_TEXT_FIELDS:
+        value = payload.get(field)
+        if isinstance(value, str):
+            profile[field] = value
+
+    for field in _PROFILE_LIST_FIELDS:
+        value = payload.get(field)
+
+        if isinstance(value, list):
+            profile[field] = list(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in value
+                    if str(item).strip()
+                )
+            )[:100]
+
+    for field in _PROFILE_BOOL_FIELDS:
+        profile[field] = bool(payload.get(field, False))
+
+    resume = payload.get("resume")
+
+    if isinstance(resume, dict):
+        profile["resume"] = resume
+
+    profile["experienceHistory"] = _normalize_jobs(
+        payload.get("experienceHistory"),
+        profile.get("currentTitle", ""),
+        profile.get("currentCompany", ""),
+    )
+    profile["updatedAt"] = str(payload.get("updatedAt") or "")
     profile["completion"] = _profile_completion(profile)
+
     return profile
 
-
-def update_profile(changes: dict) -> dict:
+def update_profile(uid: str, changes: dict) -> dict:
     if not isinstance(changes, dict):
         raise ValueError("profile must be an object")
+
+    uid = str(uid or "").strip()
+
+    if not uid:
+        raise ValueError("authenticated user UID is required")
+
     with _profile_lock:
-        profile = read_profile()
+        profile = read_profile(uid)
+
         for field in _PROFILE_TEXT_FIELDS:
             if field in changes:
-                profile[field] = str(changes[field] or "").strip()[:10_000]
+                profile[field] = str(
+                    changes[field] or ""
+                ).strip()[:10_000]
+
         for field in _PROFILE_LIST_FIELDS:
             if field not in changes:
                 continue
+
             value = changes[field]
+
             if not isinstance(value, list):
                 raise ValueError(f"{field} must be a list")
-            profile[field] = list(dict.fromkeys(
-                str(item).strip()[:120] for item in value if str(item).strip()
-            ))[:100]
+
+            profile[field] = list(
+                dict.fromkeys(
+                    str(item).strip()[:120]
+                    for item in value
+                    if str(item).strip()
+                )
+            )[:100]
+
+        if "experienceHistory" in changes:
+            jobs = _normalize_jobs(changes.get("experienceHistory"))
+            profile["experienceHistory"] = jobs
+            if jobs and jobs[0].get("title"):
+                profile["currentTitle"] = jobs[0]["title"]
+            if jobs and jobs[0].get("company"):
+                profile["currentCompany"] = jobs[0]["company"]
+
         for field in _PROFILE_BOOL_FIELDS:
             if field in changes:
                 profile[field] = bool(changes[field])
-        profile["updatedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        profile.pop("completion", None)
-        _write_json(PROFILE_FILE, profile)
-    event("profile", "info", "profile updated")
-    return read_profile()
 
+        profile["updatedAt"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        profile.pop("completion", None)
+
+        try:
+            _profile_document(uid).set(profile)
+        except Exception as exc:
+            event(
+                "profile",
+                "error",
+                f"profile update failed: {exc}",
+            )
+            raise ValueError("could not update profile") from exc
+
+    event("profile", "info", "profile updated")
+
+    return read_profile(uid)
 
 def _resume_text(content: bytes, suffix: str) -> str:
+    suffix = suffix.casefold()
+
     if suffix == ".txt":
         return content.decode("utf-8", errors="replace")
+
     if suffix == ".docx":
-        try:
-            with zipfile.ZipFile(io.BytesIO(content)) as archive:
-                xml = archive.read("word/document.xml")
-            root = ElementTree.fromstring(xml)
-        except (KeyError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
-            raise ValueError("invalid DOCX resume") from exc
-        paragraphs = []
-        for paragraph in root.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"):
-            text = "".join(
-                node.text or ""
-                for node in paragraph.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t")
-            ).strip()
-            if text:
-                paragraphs.append(text)
-        return "\n".join(paragraphs)
+        return _docx_resume_text(content)
+
     if suffix == ".pdf":
-        try:
-            from pypdf import PdfReader
-        except ImportError as exc:
-            raise ValueError("PDF parsing requires the pypdf package from backend/requirements.txt") from exc
-        try:
-            reader = PdfReader(io.BytesIO(content), strict=False)
-            if reader.is_encrypted:
-                reader.decrypt("")
-            pages = []
-            for page in reader.pages:
-                pages.append(page.extract_text() or "")
-            text = "\n".join(pages).strip()
-            if not text:
-                raise ValueError("This PDF has no selectable text. Export it as DOCX, or upload a text-based PDF.")
-            return text
-        except ValueError:
-            raise
-        except Exception as exc:
-            event("profile", "error", f"pdf parse failed: {exc}")
-            raise ValueError(
-                "This PDF could not be read. Export it as DOCX, or use a PDF with selectable text."
-            ) from exc
+        return _pdf_resume_text(content)
+
     raise ValueError("resume must be a PDF, DOCX, or TXT file")
 
+def _docx_resume_text(content: bytes) -> str:
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            xml = archive.read("word/document.xml")
 
-def _section(text: str, headings: tuple[str, ...], stops: tuple[str, ...]) -> str:
-    lines = [line.strip() for line in text.splitlines()]
-    start = next(
-        (index + 1 for index, line in enumerate(lines) if line.casefold().rstrip(":") in headings),
-        None,
+        root = ElementTree.fromstring(xml)
+
+    except (
+        KeyError,
+        zipfile.BadZipFile,
+        ElementTree.ParseError,
+    ) as exc:
+        raise ValueError("invalid DOCX resume") from exc
+
+    namespace = (
+        "{http://schemas.openxmlformats.org/"
+        "wordprocessingml/2006/main}"
     )
-    if start is None:
-        return ""
-    selected = []
-    for line in lines[start:]:
-        folded = line.casefold().rstrip(":")
-        if folded in stops:
+
+    paragraphs = []
+
+    for paragraph in root.iter(f"{namespace}p"):
+        text = "".join(
+            node.text or ""
+            for node in paragraph.iter(f"{namespace}t")
+        ).strip()
+
+        if text:
+            paragraphs.append(text)
+
+    extracted = "\n".join(paragraphs).strip()
+
+    if len(extracted) < 20:
+        raise ValueError(
+            "could not extract enough text from the DOCX resume"
+        )
+
+    return extracted
+
+def _pdf_resume_text(content: bytes) -> str:
+    errors = []
+
+    # First parser: pypdf
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(content), strict=False)
+
+        if reader.is_encrypted:
+            decrypt_result = reader.decrypt("")
+
+            if decrypt_result == 0:
+                raise ValueError(
+                    "password-protected PDF is not supported"
+                )
+
+        pages = []
+
+        for page in reader.pages:
+            try:
+                text = page.extract_text(
+                    extraction_mode="layout"
+                ) or ""
+            except TypeError:
+                # For older pypdf versions without extraction_mode.
+                text = page.extract_text() or ""
+
+            if text.strip():
+                pages.append(text)
+
+        extracted = "\n".join(pages).strip()
+
+        if len(extracted) >= 20:
+            return extracted
+
+        errors.append("pypdf returned insufficient text")
+
+    except Exception as exc:
+        errors.append(f"pypdf: {exc}")
+
+    # Second parser: PyMuPDF
+    try:
+        import fitz
+
+        document = fitz.open(
+            stream=content,
+            filetype="pdf",
+        )
+
+        pages = []
+
+        for page in document:
+            blocks = page.get_text("blocks")
+            blocks.sort(key=lambda block: (block[1], block[0]))
+
+            page_text = "\n".join(
+                str(block[4]).strip()
+                for block in blocks
+                if len(block) > 4 and str(block[4]).strip()
+            )
+
+            if page_text:
+                pages.append(page_text)
+
+        document.close()
+
+        extracted = "\n".join(pages).strip()
+
+        if len(extracted) >= 20:
+            return extracted
+
+        errors.append("PyMuPDF returned insufficient text")
+
+    except Exception as exc:
+        errors.append(f"PyMuPDF: {exc}")
+
+    event(
+        "profile",
+        "error",
+        "PDF extraction failed: " + "; ".join(errors),
+    )
+
+    raise ValueError(
+        "This PDF contains insufficient selectable text. "
+        "Upload a text-based PDF or DOCX file. "
+        "A scanned or image-only PDF requires OCR."
+    )
+
+
+import re
+from typing import Optional
+
+
+# Canonical headings supported by the parser.
+_SECTION_HEADINGS = {
+    "summary": {
+        "summary",
+        "profile",
+        "professional summary",
+        "career summary",
+        "executive summary",
+        "about me",
+    },
+    "skills": {
+        "skills",
+        "skill summary",
+        "skills summary",
+        "technical skills",
+        "core skills",
+        "core competencies",
+        "technologies",
+        "technical expertise",
+    },
+    "experience": {
+        "experience",
+        "work experience",
+        "professional experience",
+        "employment",
+        "employment history",
+        "work history",
+        "career history",
+    },
+    "certifications": {
+        "certification",
+        "certifications",
+        "certifications and achievements",
+        "certifications & achievements",
+        "achievements",
+        "awards",
+        "awards and achievements",
+        "awards & achievements",
+    },
+    "education": {
+        "education",
+        "academic background",
+        "academic qualifications",
+        "qualifications",
+        "educational qualifications",
+    },
+    "projects": {
+        "projects",
+        "project experience",
+        "personal projects",
+        "academic projects",
+    },
+}
+
+def _normalize_heading(value: str) -> str:
+    value = str(value or "").strip()
+
+    value = re.sub(r"^[\s#*_•\-–—:|]+", "", value)
+    value = re.sub(r"[\s#*_•\-–—:|]+$", "", value)
+    value = re.sub(r"\s*&\s*", " and ", value)
+    value = re.sub(r"\s+", " ", value)
+
+    return value.casefold().strip()
+
+def _heading_type(line: str) -> Optional[str]:
+    normalized = _normalize_heading(line)
+
+    if not normalized or len(normalized) > 80:
+        return None
+
+    for section_type, headings in _SECTION_HEADINGS.items():
+        normalized_headings = {
+            _normalize_heading(heading)
+            for heading in headings
+        }
+
+        if normalized in normalized_headings:
+            return section_type
+
+    return None
+
+def _clean_resume_lines(text: str) -> list[str]:
+    text = str(text or "").replace("\x00", " ")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    cleaned = []
+
+    for raw_line in text.splitlines():
+        line = re.sub(r"[ \t]+", " ", raw_line).strip()
+
+        line = re.sub(r"^\*+\s*", "", line)
+        line = re.sub(r"\s*\*+$", "", line)
+
+        if line:
+            cleaned.append(line)
+
+    return cleaned
+
+def _extract_section(lines: list[str], section_name: str) -> str:
+    """
+    Extract one section and stop at the next recognized heading.
+
+    This prevents Certifications, Achievements and Education from being
+    included in experience history.
+    """
+    start_index = None
+
+    for index, line in enumerate(lines):
+        if _heading_type(line) == section_name:
+            start_index = index + 1
             break
+
+    if start_index is None:
+        return ""
+
+    selected = []
+
+    for line in lines[start_index:]:
+        if _heading_type(line) is not None:
+            break
+
         selected.append(line)
+
     return "\n".join(selected).strip()[:10_000]
 
 
-def parse_resume(text: str) -> dict:
-    text = text.replace("\x00", " ")
-    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
-    lines = [line for line in lines if line]
-    joined = "\n".join(lines)
-    email = re.search(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", joined)
-    phone = re.search(r"(?<!\d)(?:\+?91[\s-]?)?[6-9]\d{9}(?!\d)", re.sub(r"[() ]", "", joined))
-    urls = re.findall(r"https?://[^\s|,;]+|(?:linkedin\.com|github\.com)/[^\s|,;]+", joined, re.I)
+def _looks_like_contact_line(line: str) -> bool:
+    folded = line.casefold()
 
-    name = ""
-    for line in lines[:8]:
-        if "@" in line or re.search(r"\d{6,}", line) or "http" in line.casefold():
-            continue
-        words = line.split()
-        if 2 <= len(words) <= 5 and len(line) <= 70:
-            name = line
+    return bool(
+        "@" in line
+        or "linkedin" in folded
+        or "github" in folded
+        or re.search(r"\+?\d[\d\s\-()]{8,}", line)
+    )
+
+
+def _extract_name(lines: list[str]) -> str:
+    for line in lines[:10]:
+        if _heading_type(line):
             break
+
+        if _looks_like_contact_line(line):
+            continue
+
+        candidate = re.sub(
+            r"\b(?:email|mobile|phone|linkedin)\s*:.*$",
+            "",
+            line,
+            flags=re.I,
+        ).strip()
+
+        words = candidate.split()
+
+        if (
+            2 <= len(words) <= 5
+            and len(candidate) <= 70
+            and not re.search(r"\d", candidate)
+        ):
+            return candidate.title() if candidate.isupper() else candidate
+
+    return ""
+
+def _extract_current_employment(
+    experience_text: str,
+) -> tuple[str, str]:
+
+    lines = [
+        re.sub(r"\s+", " ", line).strip()
+        for line in experience_text.splitlines()
+        if line.strip()
+    ]
+
+    if not lines:
+        return "", ""
 
     title = ""
-    start = lines.index(name) + 1 if name in lines else 0
-    for line in lines[start:start + 6]:
-        if "@" not in line and not re.search(r"\d{6,}", line) and len(line) <= 100:
-            title = line
+    company = ""
+
+    for line in lines[:5]:
+
+        if line.lower().startswith("client:"):
+            continue
+
+        if line.startswith(("•", "-", "*")):
+            continue
+
+        header = line
+
+        match = re.match(
+            r"^(?P<title>.+?)\s*(?:—|–|-| at )\s*(?P<company>.+)$",
+            header,
+            re.I,
+        )
+
+        if match:
+            title = match.group("title").strip()
+            company_text = match.group("company").strip()
+
+            company = company_text.split(",")[0].strip()
             break
 
-    skills = [
-        skill for skill in _SKILL_TERMS
-        if re.search(rf"(?<![a-z0-9]){re.escape(skill.casefold())}(?![a-z0-9])", joined.casefold())
-    ]
-    years = re.findall(r"(\d{1,2}(?:\.\d+)?)\s*\+?\s*years?", joined, re.I)
-    numeric_years = [float(value) for value in years if float(value) <= 50]
-    total_experience = f"{max(numeric_years):g} years" if numeric_years else ""
-    linkedin = next((url for url in urls if "linkedin.com" in url.casefold()), "")
-    github = next((url for url in urls if "github.com" in url.casefold()), "")
-    portfolio = next((url for url in urls if url not in {linkedin, github}), "")
-    all_headings = (
-        "experience", "work experience", "professional experience", "employment",
-        "education", "academic background", "qualifications", "skills",
-        "technical skills", "projects", "certifications", "summary", "profile",
-    )
-    experience = _section(
-        joined,
-        ("experience", "work experience", "professional experience", "employment"),
-        all_headings,
-    )
-    education = _section(
-        joined,
-        ("education", "academic background", "qualifications"),
-        all_headings,
-    )
-    summary = _section(joined, ("summary", "profile", "professional summary"), all_headings)
+        parts = [p.strip() for p in header.split(",") if p.strip()]
+
+        if len(parts) >= 2:
+            title = parts[0]
+            company = parts[1]
+            break
+
+    return title[:150], company[:150]
+
+
+_MONTH = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
+_YEAR = r"(?:19|20)\d{2}"
+_DATE_POINT = rf"(?:{_MONTH}\s+{_YEAR}|{_YEAR}|(?:0?[1-9]|1[0-2])/{_YEAR})"
+_DATE_RANGE = re.compile(
+    rf"(?P<start>{_DATE_POINT})\s*(?:-|–|—|to)\s*(?P<end>{_DATE_POINT}|present|current|now)",
+    re.I,
+)
+
+
+def _clean_job(item: dict) -> dict:
+    end = str(item.get("endDate") or "").strip()
+    if end.casefold() in {"present", "current", "now"}:
+        end = "Present"
     return {
-        "fullName": name,
-        "email": email.group(0) if email else "",
-        "phone": phone.group(0) if phone else "",
-        "headline": title,
-        "currentTitle": title,
+        "title": str(item.get("title") or "").strip()[:150],
+        "company": str(item.get("company") or "").strip()[:150],
+        "startDate": str(item.get("startDate") or "").strip()[:40],
+        "endDate": end[:40],
+        "location": str(item.get("location") or "").strip()[:80],
+        "description": str(item.get("description") or "").strip()[:4000],
+    }
+
+
+def _job_has_content(job: dict) -> bool:
+    return any(job.get(key) for key in ("title", "company", "startDate", "endDate", "location", "description"))
+
+
+def _normalize_jobs(value, title: str = "", company: str = "") -> list[dict]:
+    """One entry per role. A legacy paragraph becomes a single role."""
+    jobs = []
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                jobs.append(_clean_job(item))
+            elif str(item or "").strip():
+                jobs.append(_clean_job({"description": item}))
+    elif str(value or "").strip():
+        jobs.append(_clean_job({
+            "title": title,
+            "company": company,
+            "description": value,
+        }))
+    return [job for job in jobs if _job_has_content(job)][:12]
+
+
+def _is_bullet(line: str) -> bool:
+    return bool(re.match(r"^(?:[•*]|\-|–)\s+\S", line))
+
+
+def _role_company(line: str) -> tuple[str, str]:
+    """Title and company from one header, the way a portal role line is written."""
+    if line.endswith((".", "!", "?")) or len(line) > 90:
+        return "", ""
+    match = re.match(r"^(?P<title>.+?)\s*(?:—|–|\||\bat\b)\s*(?P<company>.+)$", line, re.I)
+    if match and not _DATE_RANGE.search(match.group("title")):
+        return match.group("title").strip(" ,"), match.group("company").split(",")[0].strip(" ,")
+    if "," in line and not _DATE_RANGE.search(line):
+        title, company = [part.strip() for part in line.split(",", 1)]
+        if title and company and len(title) <= 80 and len(company) <= 80:
+            return title, company.split(",")[0].strip(" ,")
+    return "", ""
+
+
+def _parse_jobs(experience_text: str) -> list[dict]:
+    """Split a resume experience section into separate roles."""
+    lines = [re.sub(r"\s+", " ", line).strip() for line in (experience_text or "").splitlines() if line.strip()]
+    jobs: list[dict] = []
+    current = None
+    notes: list[str] = []
+
+    def flush() -> None:
+        nonlocal current, notes
+        if current is None:
+            return
+        current["description"] = "\n".join(note for note in notes if note).strip()[:4000]
+        if _job_has_content(current):
+            jobs.append(_clean_job(current))
+        current = None
+        notes = []
+
+    def begin(title: str = "", company: str = "") -> None:
+        nonlocal current, notes
+        flush()
+        current = {
+            "title": title,
+            "company": company,
+            "startDate": "",
+            "endDate": "",
+            "location": "",
+            "description": "",
+        }
+        notes = []
+
+    for index, line in enumerate(lines):
+        if _is_bullet(line):
+            if current is None:
+                begin()
+            notes.append(re.sub(r"^(?:[•*]|\-|–)\s+", "", line).strip())
+            continue
+        date = _DATE_RANGE.search(line)
+        title, company = _role_company(line)
+        upcoming = lines[index + 1] if index + 1 < len(lines) else ""
+        followed_by_date = bool(upcoming) and not _is_bullet(upcoming) and bool(_DATE_RANGE.search(upcoming))
+        if date and not title and len(line) <= 60:
+            if current is None:
+                begin()
+            current["startDate"] = date.group("start")
+            end = date.group("end")
+            current["endDate"] = "Present" if end.casefold() in {"present", "current", "now"} else end
+            continue
+        if title or followed_by_date:
+            begin(title or line, company)
+            if date:
+                current["startDate"] = date.group("start")
+                end = date.group("end")
+                current["endDate"] = "Present" if end.casefold() in {"present", "current", "now"} else end
+            continue
+        if current is None:
+            begin(line)
+            continue
+        if not current["company"] and not current["startDate"]:
+            current["company"] = line[:150]
+            continue
+        if (
+            not current["location"]
+            and not notes
+            and len(line) <= 40
+            and len(line.split()) <= 4
+            and not line.endswith(".")
+        ):
+            current["location"] = line
+            continue
+        notes.append(line)
+    flush()
+    return jobs[:12]
+
+
+def _extract_total_experience(
+    text: str,
+    summary: str,
+) -> str:
+
+    search_text = summary or text
+
+    patterns = (
+        r"\b(?:over|more than)\s+(?P<value>\d+(?:\.\d+)?)\s+years?\b",
+        r"\b(?P<value>\d+(?:\.\d+)?)\s*\+?\s+years?(?:\s+of)?\s+(?:professional\s+)?experience\b",
+        r"\bexperience\s+of\s+(?P<value>\d+(?:\.\d+)?)\s*\+?\s+years?\b",
+        r"\b(?P<article>an|one)\s+year\s+of\s+experience\b",
+    )
+
+    for pattern in patterns:
+
+        match = re.search(pattern, search_text, re.I)
+
+        if not match:
+            continue
+
+        if match.groupdict().get("value"):
+            value = float(match.group("value"))
+
+            if 0 < value <= 50:
+                return f"{value:g} years"
+
+        if match.groupdict().get("article"):
+            return "1 year"
+
+    return ""
+
+
+def _extract_notice_period(text: str) -> str:
+    patterns = (
+        r"\bnotice period\s*[:\-]?\s*([^\n|,;]+)",
+        r"\b(?:available|availability)\s*[:\-]?\s*([^\n|,;]+)",
+        r"\b(immediate joiner)\b",
+        r"\b(serving notice period)\b",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+
+        if match:
+            value = match.group(1).strip()
+            return value[:120]
+
+    return ""
+
+def _extract_skills(skills_text: str, full_text: str) -> list[str]:
+
+    source_text = skills_text or full_text
+    folded = source_text.casefold()
+
+    discovered = []
+
+    for skill in _SKILL_TERMS:
+
+        pattern = (
+            rf"(?<![a-z0-9])"
+            rf"{re.escape(skill.casefold())}"
+            rf"(?![a-z0-9])"
+        )
+
+        if re.search(pattern, folded):
+            discovered.append(skill)
+
+    return discovered
+def parse_resume(text: str) -> dict:
+
+    lines = _clean_resume_lines(text)
+    joined = "\n".join(lines)
+
+    email_match = re.search(
+        r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+",
+        joined,
+    )
+
+    phone_match = re.search(
+        r"(?<!\d)(?:\+?91[\s-]?)?[6-9]\d{9}(?!\d)",
+        joined,
+    )
+
+    urls = re.findall(
+        r"https?://[^\s|,;]+|(?:linkedin\.com|github\.com)/[^\s|,;]+",
+        joined,
+        re.I,
+    )
+
+    summary = _extract_section(lines, "summary")
+    skills_text = _extract_section(lines, "skills")
+    experience = _extract_section(lines, "experience")
+    education = _extract_section(lines, "education")
+
+    jobs = _parse_jobs(experience)
+    current_title = jobs[0]["title"] if jobs else ""
+    current_company = jobs[0]["company"] if jobs else ""
+    if not current_title and not current_company:
+        current_title, current_company = _extract_current_employment(experience)
+
+    skills = _extract_skills(
+        skills_text,
+        joined,
+    )
+
+    linkedin = next(
+        (
+            url.rstrip(".)]")
+            for url in urls
+            if "linkedin.com" in url.casefold()
+        ),
+        "",
+    )
+
+    github = next(
+        (
+            url.rstrip(".)]")
+            for url in urls
+            if "github.com" in url.casefold()
+        ),
+        "",
+    )
+
+    portfolio = next(
+        (
+            url.rstrip(".)]")
+            for url in urls
+            if url not in {linkedin, github}
+        ),
+        "",
+    )
+
+    return {
+        "fullName": _extract_name(lines),
+        "email": email_match.group(0) if email_match else "",
+        "phone": phone_match.group(0) if phone_match else "",
+        "headline": current_title,
+        "currentTitle": current_title,
+        "currentCompany": current_company,
         "summary": summary,
-        "totalExperience": total_experience,
+        "totalExperience": _extract_total_experience(
+            joined,
+            summary,
+        ),
+        "noticePeriod": _extract_notice_period(joined),
         "skills": skills,
         "linkedin": linkedin,
         "github": github,
         "portfolio": portfolio,
         "education": education,
-        "experienceHistory": experience,
+        "experienceHistory": jobs,
     }
 
 
-def upload_resume(payload: dict) -> dict:
+def upload_resume(uid: str, payload: dict) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("resume payload must be an object")
-    filename = Path(str(payload.get("filename") or "")).name
+
+    uid = str(uid or "").strip()
+
+    if not uid:
+        raise ValueError("authenticated user UID is required")
+
+    filename = Path(
+        str(payload.get("filename") or "")
+    ).name
+
     suffix = Path(filename).suffix.casefold()
+
+    if suffix not in {".pdf", ".docx", ".txt"}:
+        raise ValueError(
+            "resume must be a PDF, DOCX, or TXT file"
+        )
+
     encoded = payload.get("content")
+
     if not isinstance(encoded, str):
         raise ValueError("resume content is required")
+
     try:
-        content = base64.b64decode(encoded, validate=True)
+        content = base64.b64decode(
+            encoded,
+            validate=True,
+        )
     except (binascii.Error, ValueError) as exc:
-        raise ValueError("resume content must be base64") from exc
+        raise ValueError(
+            "resume content must be valid base64"
+        ) from exc
+
     if not content:
         raise ValueError("resume is empty")
-    if len(content) > MAX_RESUME_BYTES:
-        raise ValueError("resume must be 8 MB or smaller")
 
+    if len(content) > MAX_RESUME_BYTES:
+        raise ValueError(
+            "resume must be 8 MB or smaller"
+        )
+
+    event(
+        "profile",
+        "info",
+        f"resume uploaded filename={filename} bytes={len(content)}",
+    )
     text = _resume_text(content, suffix)
+
     if len(text.strip()) < 20:
-        raise ValueError("could not extract enough text from this resume")
+        raise ValueError(
+            "could not extract enough text from this resume"
+        )
+
     extracted = parse_resume(text)
-    RESUME_DIR.mkdir(parents=True, exist_ok=True)
-    for old in RESUME_DIR.glob("resume.*"):
-        old.unlink(missing_ok=True)
-    resume_path = RESUME_DIR / f"resume{suffix}"
-    resume_path.write_bytes(content)
+    filled = [name for name, value in extracted.items() if value]
+    event(
+        "profile",
+        "info",
+        f"resume parsed filename={filename} fields={', '.join(filled) or 'none'}",
+    )
+
+    uploaded_at = datetime.now(
+        timezone.utc
+    ).isoformat()
 
     with _profile_lock:
-        profile = read_profile()
+        profile = read_profile(uid)
+
+        # Update only fields that were successfully extracted.
+        # Existing manually entered data remains unchanged when
+        # the parser cannot identify a value.
         for field, value in extracted.items():
             if value:
                 profile[field] = value
-        uploaded = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
         profile["resume"] = {
             "filename": filename,
             "size": len(content),
-            "uploadedAt": uploaded,
+            "uploadedAt": uploaded_at,
             "type": suffix.lstrip(".").upper(),
         }
-        profile["updatedAt"] = uploaded
-        profile.pop("completion", None)
-        _write_json(PROFILE_FILE, profile)
-    event("profile", "info", f"resume uploaded filename={filename} bytes={len(content)}")
-    return {"profile": read_profile(), "extracted": extracted}
 
+        profile["updatedAt"] = uploaded_at
+        profile.pop("completion", None)
+
+        try:
+            _profile_document(uid).set(profile)
+        except Exception as exc:
+            event(
+                "profile",
+                "error",
+                (
+                    f"resume profile save failed: {exc}"
+                ),
+            )
+            raise ValueError(
+                "could not save parsed resume profile"
+            ) from exc
+
+    event(
+        "profile",
+        "info",
+        f"parsed details saved filename={filename}",
+    )
+
+    return {
+        "profile": read_profile(uid),
+        "extracted": extracted,
+    }
 
 SNAPSHOT_VERSION = 3
 
@@ -1152,17 +1998,17 @@ def with_note_key(note: dict) -> dict:
     return {**note, "portalKey": key}
 
 
-def _portal_catalog() -> list[dict]:
-    live = FEED_COORDINATOR.status()
-    main_running = bool(_progress.get("running"))
+def _portal_catalog(live: bool = True) -> list[dict]:
+    live_state = FEED_COORDINATOR.status() if live else {}
+    main_running = live and bool(_progress.get("running"))
     catalog = []
     for cls in CONNECTORS:
-        info = live.get(cls.key, {})
+        info = live_state.get(cls.key, {})
         if cls.key in PAUSED_SIDECAR_KEYS:
             status = "paused"
-        elif info.get("running"):
+        elif live and info.get("running"):
             status = "running"
-        elif getattr(cls, "persist", "") != "sidecar" and main_running:
+        elif live and getattr(cls, "persist", "") != "sidecar" and main_running:
             status = "running"
         elif info.get("error"):
             status = "error"
@@ -1210,6 +2056,7 @@ def _payload_from_progress(loading: bool, cached: bool = False) -> dict:
 
 
 def _remember(generation: int, connector, batch: list[Job], preferences: dict | None = None) -> None:
+    store_cloud = False
     with _jobs_lock:
         if generation != _progress["generation"]:
             return
@@ -1241,8 +2088,14 @@ def _remember(generation: int, connector, batch: list[Job], preferences: dict | 
             })
         now = time.monotonic()
         if batch and now - _progress.get("last_write", 0.0) >= 0.6:
-            write_jobs_file(_payload_from_progress(loading=not _progress.get("stopped")))
+            if not _progress.get("owner"):
+                write_jobs_file(_payload_from_progress(loading=not _progress.get("stopped")))
             _progress["last_write"] = now
+            store_cloud = bool(_progress.get("owner"))
+        else:
+            store_cloud = False
+    if store_cloud:
+        _store_owner_results(force=False)
 
 
 def _finish_fetch(generation: int, error: str = "") -> None:
@@ -1257,8 +2110,12 @@ def _finish_fetch(generation: int, error: str = "") -> None:
             event("jobs", "error", error)
         else:
             event("jobs", "info", f"company boards done jobs={len(_progress['jobs'])}")
+        owner = str(_progress.get("owner") or "")
         payload = _payload_from_progress(loading=False)
-        write_jobs_file(payload)
+        if not owner:
+            write_jobs_file(payload)
+    if owner:
+        _store_owner_results(force=not _feeds_running())
 
 
 def _portal_sources() -> list[type]:
@@ -1267,9 +2124,14 @@ def _portal_sources() -> list[type]:
 
 def _fetch_worker(country: str, generation: int, preferences: dict) -> None:
     event("jobs", "info", "company boards start")
+    paused = set(preferences.get("pausedPortals") or [])
+    sources = [cls for cls in _portal_sources() if cls.key not in paused]
+    if not sources:
+        _finish_fetch(generation)
+        return
     try:
         run_sources(
-            _portal_sources(),
+            sources,
             query="",
             where="",
             limit=0,
@@ -1285,7 +2147,7 @@ def _fetch_worker(country: str, generation: int, preferences: dict) -> None:
     _finish_fetch(generation)
 
 
-def _reset_progress() -> None:
+def _reset_progress(uid: str = "") -> None:
     _progress["generation"] += 1
     _progress["running"] = True
     _progress["jobs"] = []
@@ -1296,12 +2158,20 @@ def _reset_progress() -> None:
     _progress["error"] = ""
     _progress["fetchedAt"] = ""
     _progress["last_write"] = 0.0
+    _progress["last_cloud"] = 0.0
     _progress["stopped"] = False
+    _progress["owner"] = str(uid or "")
+    _progress["pausedPortals"] = []
     arm()
     FEED_COORDINATOR.suppressed = False
 
 
-def stop_fetches() -> dict:
+def stop_fetches(uid: str = "") -> dict:
+    owner = str(_progress.get("owner") or "")
+    uid = str(uid or "").strip()
+    if owner and uid != owner:
+        stored = read_user_jobs(uid) if uid else None
+        return _respond_saved(stored or _blank_search())
     cancel()
     from connectors.Naukri.Naukri import close_naukri_browser
 
@@ -1315,13 +2185,18 @@ def stop_fetches() -> dict:
         if note not in _progress["notes"]:
             _progress["notes"].append(note)
         payload = _payload_from_progress(loading=False)
-        write_jobs_file(payload)
-    return _respond(payload)
+        if not owner:
+            write_jobs_file(payload)
+    responded = _respond(payload)
+    if owner:
+        _store_owner_results(responded, force=True)
+    return responded
 
 
-def _start_main_fetch(country: str, refresh_sidecars: bool, preferences: dict) -> dict:
+def _start_main_fetch(country: str, refresh_sidecars: bool, preferences: dict, uid: str = "") -> dict:
     with _jobs_lock:
-        _reset_progress()
+        _reset_progress(uid)
+        _progress["pausedPortals"] = list(preferences.get("pausedPortals") or [])
         generation = _progress["generation"]
         payload = _payload_from_progress(loading=True)
     FEED_COORDINATOR.start_all(refresh_sidecars, _feed_preferences(preferences))
@@ -1334,7 +2209,271 @@ def _start_main_fetch(country: str, refresh_sidecars: bool, preferences: dict) -
     return payload
 
 
-def saved_or_live_jobs(country: str, refresh: bool, preferences: dict) -> dict:
+_JOB_PART_BYTES = 700_000
+_job_search_memory: dict | None = None
+_BUSY_NOTE = {
+    "portal": "fetch",
+    "portalKey": "",
+    "message": "Another search is still running. Showing your last results.",
+}
+
+
+def _feeds_running() -> bool:
+    return bool(FEED_COORDINATOR._running)
+
+
+def _blank_search() -> dict:
+    return {
+        "source": "all",
+        "query": "",
+        "where": "",
+        "limit": 0,
+        "count": 0,
+        "jobs": [],
+        "credits": [],
+        "notes": [],
+        "windowDays": WINDOW_DAYS,
+        "version": SNAPSHOT_VERSION,
+        "loading": False,
+        "cached": False,
+        "fetchedAt": "",
+        "error": "",
+        "stopped": False,
+    }
+
+
+def _fetched_jobs_id(index: int) -> str:
+    """First result document is jobs. Extra documents exist only past the size limit."""
+    return "jobs" if index == 0 else f"jobs-{index + 1}"
+
+
+def _chunk_jobs(jobs: list[dict]) -> list[list[dict]]:
+    """Split a result list into pieces that fit in one Firestore document."""
+    parts: list[list[dict]] = []
+    current: list[dict] = []
+    size = 2
+    for job in jobs:
+        extra = len(json.dumps(job, ensure_ascii=False).encode("utf-8")) + 1
+        if current and size + extra > _JOB_PART_BYTES:
+            parts.append(current)
+            current = []
+            size = 2
+        current.append(job)
+        size += extra
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _search_record(payload: dict) -> dict:
+    jobs = [dict(job) for job in payload.get("jobs") or [] if isinstance(job, dict)]
+    return {
+        "source": payload.get("source") or "all",
+        "query": payload.get("query") or "",
+        "where": payload.get("where") or "",
+        "limit": payload.get("limit") or 0,
+        "jobs": jobs,
+        "credits": list(payload.get("credits") or []),
+        "notes": [dict(note) for note in payload.get("notes") or [] if isinstance(note, dict)],
+        "windowDays": payload.get("windowDays") or WINDOW_DAYS,
+        "version": SNAPSHOT_VERSION,
+        "loading": bool(payload.get("loading")),
+        "cached": True,
+        "fetchedAt": str(payload.get("fetchedAt") or ""),
+        "error": str(payload.get("error") or ""),
+        "stopped": bool(payload.get("stopped")),
+        "count": len(jobs),
+    }
+
+
+def _job_search_collection(uid: str):
+    return (
+        get_firestore_client()
+        .collection("users")
+        .document(uid)
+        .collection("jobSearch")
+    )
+
+
+def replace_user_jobs(uid: str, payload: dict) -> None:
+    """Overwrite this user's search. The job list is stored in the jobs document."""
+    uid = str(uid or "").strip()
+    if not uid:
+        return
+    record = _search_record(payload)
+    jobs = record.pop("jobs")
+    if _job_search_memory is not None:
+        _job_search_memory[uid] = {**record, "jobs": jobs}
+        return
+    chunks = _chunk_jobs(jobs)
+    record["jobDocuments"] = len(chunks)
+    collection = _job_search_collection(uid)
+    previous_jobs = 0
+    previous_parts = 0
+    status = collection.document("status").get()
+    if status.exists:
+        stored = status.to_dict() or {}
+        previous_jobs = int(stored.get("jobDocuments") or 0)
+        previous_parts = int(stored.get("parts") or 0)
+    collection.document("status").set(record)
+    for index, chunk in enumerate(chunks):
+        collection.document(_fetched_jobs_id(index)).set({"jobs": chunk})
+    for index in range(len(chunks), max(previous_jobs, len(chunks))):
+        collection.document(_fetched_jobs_id(index)).delete()
+    for index in range(previous_parts):
+        collection.document(f"part-{index}").delete()
+
+
+def read_user_jobs(uid: str) -> dict | None:
+    uid = str(uid or "").strip()
+    if not uid:
+        return None
+    if _job_search_memory is not None:
+        stored = _job_search_memory.get(uid)
+        if stored is None:
+            return None
+        return {**stored, "jobs": [dict(job) for job in stored.get("jobs") or []]}
+    try:
+        status = _job_search_collection(uid).document("status").get()
+    except Exception as exc:
+        event("jobs", "error", f"search read failed: {exc}")
+        return None
+    if not status.exists:
+        return None
+    record = status.to_dict() or {}
+    document_count = int(record.pop("jobDocuments", 0) or 0)
+    legacy_parts = int(record.pop("parts", 0) or 0)
+    jobs: list[dict] = []
+    collection = _job_search_collection(uid)
+    if document_count:
+        names = [_fetched_jobs_id(index) for index in range(document_count)]
+    else:
+        names = [f"part-{index}" for index in range(legacy_parts)]
+    for name in names:
+        part = collection.document(name).get()
+        chunk = (part.to_dict() or {}).get("jobs") if part.exists else []
+        if isinstance(chunk, list):
+            jobs.extend(item for item in chunk if isinstance(item, dict))
+    if legacy_parts and not document_count and jobs:
+        try:
+            replace_user_jobs(uid, {**record, "jobs": jobs})
+        except Exception as exc:
+            event("jobs", "error", f"search rename failed: {exc}")
+    record["jobs"] = jobs
+    record["count"] = len(jobs)
+    record["cached"] = True
+    record["loading"] = False
+    return record
+
+
+def _respond_saved(payload: dict | None) -> dict:
+    """A stored search, without mixing in another user's live portal files."""
+    result = dict(payload or _blank_search())
+    jobs = [with_portal_key(record) for record in result.get("jobs") or [] if isinstance(record, dict)]
+    result["jobs"] = jobs
+    result["count"] = len(jobs)
+    result["notes"] = [with_note_key(note) for note in result.get("notes") or [] if isinstance(note, dict)]
+    result["loading"] = False
+    result["cached"] = True
+    result["portals"] = _portal_catalog(live=False)
+    result.setdefault("credits", [])
+    result.setdefault("windowDays", WINDOW_DAYS)
+    result.setdefault("version", SNAPSHOT_VERSION)
+    result.setdefault("fetchedAt", "")
+    result.setdefault("error", "")
+    result.setdefault("stopped", False)
+    result.setdefault("source", "all")
+    return result
+
+
+def _without_paused_jobs(payload: dict, paused: set[str]) -> dict:
+    """Keep another user's active portal out of this user's saved search."""
+    if not paused:
+        return payload
+    result = dict(payload)
+    result["jobs"] = [
+        job for job in result.get("jobs") or []
+        if (job.get("portalKey") or "") not in paused
+    ]
+    result["count"] = len(result["jobs"])
+    return result
+
+
+def _store_owner_results(payload: dict | None = None, force: bool = False) -> None:
+    uid = str(_progress.get("owner") or "")
+    if not uid:
+        return
+    now = time.monotonic()
+    if not force and now - float(_progress.get("last_cloud") or 0) < 15:
+        return
+    if payload is None:
+        loading = bool(_progress.get("running")) or _feeds_running()
+        payload = _respond(_payload_from_progress(loading=loading))
+    payload = _without_paused_jobs(payload, set(_progress.get("pausedPortals") or []))
+    jobs = payload.get("jobs") or []
+    if payload.get("loading") and not jobs:
+        return
+    try:
+        replace_user_jobs(uid, payload)
+    except Exception as exc:
+        event("jobs", "error", f"search save failed: {exc}")
+        return
+    _progress["last_cloud"] = now
+    if not payload.get("loading"):
+        event("jobs", "info", f"search saved jobs={len(jobs)}")
+
+
+def _after_portal(_key: str) -> None:
+    if not _progress.get("owner"):
+        return
+    boards = bool(_progress.get("running"))
+    _store_owner_results(force=not boards and not _feeds_running())
+
+
+FEED_COORDINATOR.after_portal = _after_portal
+
+
+def _user_search(country: str, refresh: bool, preferences: dict, uid: str) -> dict:
+    with _jobs_lock:
+        owner = str(_progress.get("owner") or "")
+        boards_running = bool(_progress.get("running"))
+        has_jobs = bool(_progress.get("jobs"))
+    running = boards_running or _feeds_running()
+    mine = owner == uid and (running or has_jobs)
+
+    if mine and refresh and running:
+        return _respond(_payload_from_progress(loading=True))
+    if mine and refresh and not running:
+        return _respond(_start_main_fetch(country, True, preferences, uid))
+    if mine:
+        payload = _respond(_payload_from_progress(loading=running))
+        _store_owner_results(payload, force=not running)
+        return payload
+
+    if running and owner != uid:
+        stored = read_user_jobs(uid) or _blank_search()
+        nothing_saved = not stored.get("jobs") and not stored.get("fetchedAt")
+        if refresh or nothing_saved:
+            notes = list(stored.get("notes") or [])
+            if _BUSY_NOTE not in notes:
+                notes.append(dict(_BUSY_NOTE))
+            stored = {**stored, "notes": notes}
+        return _respond_saved(stored)
+
+    stored = read_user_jobs(uid)
+    if not refresh and stored is not None and _snapshot_current(stored):
+        return _respond_saved(stored)
+    return _respond(_start_main_fetch(country, bool(refresh), preferences, uid))
+
+
+def saved_or_live_jobs(country: str, refresh: bool, preferences: dict, uid: str = "") -> dict:
+    uid = str(uid or "").strip()
+    if uid:
+        return _user_search(country, refresh, preferences, uid)
+    if _progress.get("owner"):
+        saved = dict(read_jobs_file() or _blank_search())
+        saved["jobs"] = list(saved.get("jobs") or [])
+        return _respond_saved(saved)
     if refresh:
         payload = _start_main_fetch(country, True, preferences)
         return _respond(payload)
@@ -1386,8 +2525,17 @@ def _current_view() -> dict:
     return _respond(payload)
 
 
-def jobs_summary() -> dict:
-    view = _current_view()
+def jobs_summary(uid: str = "") -> dict:
+    uid = str(uid or "").strip()
+    owner = str(_progress.get("owner") or "")
+    live = bool(_progress.get("running") or _progress.get("jobs") or _feeds_running())
+    if uid and owner == uid and live:
+        view = _current_view()
+    elif uid:
+        stored = read_user_jobs(uid)
+        view = _respond_saved(stored if stored is not None else _blank_search())
+    else:
+        view = _current_view()
     counts: dict[str, int] = {}
     new_today = 0
     for record in view.get("jobs") or []:
@@ -1403,12 +2551,18 @@ def jobs_summary() -> dict:
         if counts.get(portal["key"])
     ]
     sources.sort(key=lambda source: source["count"], reverse=True)
+    saved_count = 0
+    if uid:
+        try:
+            saved_count = len(read_saved(uid))
+        except ValueError:
+            saved_count = 0
     return {
         "sourcesConnected": len(sources),
         "sources": sources,
         "total": len(view.get("jobs") or []),
         "newToday": new_today,
-        "saved": len(read_saved()),
+        "saved": saved_count,
         "loading": bool(view.get("loading")),
         "fetchedAt": view.get("fetchedAt") or "",
     }
@@ -1433,25 +2587,59 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok"})
             return
         if route.path == "/api/jobs/stop":
-            self._send_json(200, stop_fetches())
+            event("jobs", "info", "stop requested")
+            uid = ""
+            try:
+                uid = uid_from_authorization(self.headers.get("Authorization"))
+            except (ValueError, RuntimeError, FileNotFoundError):
+                uid = ""
+            self._send_json(200, stop_fetches(uid))
             return
         if route.path == "/api/portals":
             self._send_json(200, {"portals": _portal_catalog()})
             return
         if route.path == "/api/saved":
-            saved = read_saved()
+            uid = self._user_id("saved")
+            if not uid:
+                return
+            try:
+                saved = read_saved(uid)
+            except ValueError as exc:
+                self._send_json(502, {"error": str(exc)})
+                return
             self._send_json(200, {"jobs": saved, "count": len(saved)})
             return
         if route.path == "/api/summary":
-            self._send_json(200, jobs_summary())
+            uid = ""
+            try:
+                uid = uid_from_authorization(self.headers.get("Authorization"))
+            except (ValueError, RuntimeError, FileNotFoundError):
+                uid = ""
+            self._send_json(200, jobs_summary(uid))
             return
         if route.path == "/api/profile":
-            self._send_json(200, {"profile": read_profile()})
+            try:
+                uid = uid_from_authorization(self.headers.get("Authorization"))
+            except ValueError as exc:
+                event("profile", "warning", f"profile read rejected: {exc}")
+                self._send_json(401, {"error": str(exc)})
+                return
+            except (RuntimeError, FileNotFoundError) as exc:
+                event("profile", "error", f"profile read failed: {exc}")
+                self._send_json(500, {"error": str(exc)})
+                return
+            try:
+                profile = read_profile(uid)
+            except ValueError as exc:
+                cause = exc.__cause__ or exc
+                self._send_json(502, {"error": f"{exc}: {cause}"})
+                return
+            event("profile", "info", f"profile loaded completion={profile.get('completion')}")
+            self._send_json(200, {"profile": profile})
             return
         if route.path == "/api/preferences":
-            uid = (params.get("uid") or [""])[0].strip()
+            uid = self._user_id("preferences")
             if not uid:
-                self._send_json(400, {"error": "uid is required"})
                 return
             self._send_json(200, {"preferences": read_preferences(uid)})
             return
@@ -1461,13 +2649,18 @@ class JobsApiHandler(BaseHTTPRequestHandler):
 
         first = lambda name, fallback="": (params.get(name) or [fallback])[0].strip()
         refresh = first("refresh", "").casefold() in {"1", "true", "yes"}
-        uid = first("uid")
+        uid = ""
+        try:
+            uid = uid_from_authorization(self.headers.get("Authorization"))
+        except (ValueError, RuntimeError, FileNotFoundError):
+            uid = ""
         preferences = read_preferences(uid) if uid else _empty_preferences()
         try:
             payload = saved_or_live_jobs(
                 country=first("country", self.country) or self.country,
                 refresh=refresh,
                 preferences=preferences,
+                uid=uid,
             )
             payload = apply_preferences(payload, preferences)
         except SystemExit as exc:
@@ -1488,9 +2681,11 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             try:
                 client, uid = get_user_gemini_client(auth_header)
             except ValueError as exc:
+                event("gemini", "warning", f"generate rejected: {exc}")
                 self._send_json(401, {"error": str(exc)})
                 return
             except Exception as exc:
+                event("gemini", "error", f"generate auth failed: {exc}")
                 self._send_json(500, {"error": f"Auth check failed: {exc}"})
                 return
 
@@ -1503,14 +2698,16 @@ class JobsApiHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "prompt is required"})
                 return
 
+            event("gemini", "info", f"generate started chars={len(prompt)}")
             try:
                 response = client.models.generate_content(
                     model="gemini-2.5-flash",
                     contents=prompt,
                 )
+                event("gemini", "info", "generate done")
                 self._send_json(200, {"result": response.text})
             except Exception as exc:
-                event("gemini", "error", f"Generation failed for uid={uid[:8]}: {exc}")
+                event("gemini", "error", f"generation failed: {exc}")
                 self._send_json(502, {"error": f"Gemini error: {exc}"})
             return
 
@@ -1518,9 +2715,21 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             if body is None:
                 return
+            filename = Path(str(body.get("filename") or "")).name if isinstance(body, dict) else ""
             try:
-                result = upload_resume(body)
+                uid = uid_from_authorization(self.headers.get("Authorization"))
             except ValueError as exc:
+                event("profile", "warning", f"resume upload rejected filename={filename or '-'}: {exc}")
+                self._send_json(401, {"error": str(exc)})
+                return
+            except (RuntimeError, FileNotFoundError) as exc:
+                event("profile", "error", f"resume upload failed filename={filename or '-'}: {exc}")
+                self._send_json(500, {"error": str(exc)})
+                return
+            try:
+                result = upload_resume(uid, body)
+            except ValueError as exc:
+                event("profile", "error", f"resume upload failed filename={filename or '-'}: {exc}")
                 self._send_json(400, {"error": str(exc)})
                 return
             self._send_json(200, result)
@@ -1532,12 +2741,17 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body is None:
             return
+        uid = self._user_id("saved")
+        if not uid:
+            return
         try:
-            job = save_job(body.get("job") if isinstance(body, dict) else None)
+            job = save_job(uid, body.get("job") if isinstance(body, dict) else None)
         except ValueError as exc:
+            if exc.__cause__ is None:
+                event("saved", "error", f"save failed: {exc}")
             self._send_json(400, {"error": str(exc)})
             return
-        self._send_json(201, {"job": job, "count": len(read_saved())})
+        self._send_json(201, {"job": job, "count": len(read_saved(uid))})
 
     def do_PUT(self) -> None:
         route = urlparse(self.path)
@@ -1549,21 +2763,37 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         if body is None:
             return
         if path == "/api/preferences":
-            uid = (parse_qs(route.query).get("uid") or [""])[0].strip()
+            uid = self._user_id("preferences")
+            if not uid:
+                return
             try:
                 preferences = update_preferences(
                     uid,
                     body.get("preferences") if isinstance(body, dict) else None,
                 )
             except ValueError as exc:
+                event("preferences", "error", f"update failed: {exc}")
                 self._send_json(400, {"error": str(exc)})
                 return
             self._send_json(200, {"preferences": preferences})
             return
         try:
-            profile = update_profile(body.get("profile") if isinstance(body, dict) else None)
+            uid = uid_from_authorization(self.headers.get("Authorization"))
         except ValueError as exc:
-            self._send_json(400, {"error": str(exc)})
+            event("profile", "warning", f"profile update rejected: {exc}")
+            self._send_json(401, {"error": str(exc)})
+            return
+        except (RuntimeError, FileNotFoundError) as exc:
+            event("profile", "error", f"profile update failed: {exc}")
+            self._send_json(500, {"error": str(exc)})
+            return
+        try:
+            profile = update_profile(uid, body.get("profile") if isinstance(body, dict) else None)
+        except ValueError as exc:
+            cause = exc.__cause__
+            if cause is None:
+                event("profile", "error", f"profile update failed: {exc}")
+            self._send_json(400, {"error": f"{exc}: {cause}" if cause else str(exc)})
             return
         self._send_json(200, {"profile": profile})
 
@@ -1576,8 +2806,17 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         if not link:
             self._send_json(400, {"error": "link is required"})
             return
-        removed = unsave_job(link)
-        self._send_json(200 if removed else 404, {"removed": removed, "count": len(read_saved())})
+        uid = self._user_id("saved")
+        if not uid:
+            return
+        try:
+            removed = unsave_job(uid, link)
+        except ValueError as exc:
+            self._send_json(502, {"error": str(exc)})
+            return
+        if not removed:
+            event("saved", "warning", f"remove missed {link}")
+        self._send_json(200 if removed else 404, {"removed": removed, "count": len(read_saved(uid))})
 
     def _read_json(self):
         try:
@@ -1593,8 +2832,23 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "body must be JSON"})
             return None
 
+    def _user_id(self, area: str) -> str:
+        try:
+            return uid_from_authorization(self.headers.get("Authorization"))
+        except ValueError as exc:
+            event(area, "warning", f"rejected: {exc}")
+            self._send_json(401, {"error": str(exc)})
+        except (RuntimeError, FileNotFoundError) as exc:
+            event(area, "error", f"failed: {exc}")
+            self._send_json(500, {"error": str(exc)})
+        return ""
+
     def log_message(self, fmt: str, *args) -> None:
-        event("api", "info", f"{self.address_string()} {fmt % args}")
+        message = fmt % args
+        message = re.sub(r"([?&])uid=[^&\s\"]*", r"\1", message)
+        message = message.replace("?&", "?").replace("&&", "&")
+        message = re.sub(r"[?&](?=\s|HTTP)", "", message)
+        event("api", "info", f"{self.address_string()} {message}")
 
     def _send_cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")

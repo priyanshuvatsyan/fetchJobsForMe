@@ -23,6 +23,8 @@ from Server.api import (
     Job,
     apply_url_from_html,
     clean,
+    poster_from_html,
+    posting_facts,
     extract_salary,
     is_tech_role,
     job_profile,
@@ -284,6 +286,15 @@ def _description_text(posting: dict, soup: BeautifulSoup) -> str:
     embedded = posting.get("description") or ""
     if isinstance(embedded, str) and clean(plain_text(embedded)):
         return embedded
+    for selector in (
+        ".show-more-less-html__markup",
+        ".description__text",
+        ".jobs-description__content",
+        ".jobs-box__html-content",
+    ):
+        element = soup.select_one(selector)
+        if element and clean(element.get_text(" ", strip=True)):
+            return element.decode_contents()
     text = _first_text(
         soup,
         [
@@ -310,6 +321,10 @@ def extract_job_details(url: str, card_posted: str = "") -> dict:
         "job_description": "",
         "posted_at": card_posted,
         "apply_url": "",
+        "openings": "",
+        "applicants": "",
+        "posted_by": "",
+        "email": "",
     }
     try:
         response = _session.get(url, timeout=30)
@@ -321,7 +336,7 @@ def extract_job_details(url: str, card_posted: str = "") -> dict:
     soup = _soup(response)
     posting = embedded_posting(soup)
     body = _description_text(posting, soup)
-    about_company, job_description = split_description(plain_text(body) if "<" in body else body)
+    about_company, job_description = split_description(body)
     pairs = _labeled_values(soup)
     listed_skills = _skill_text(posting.get("skills"))
     if not listed_skills:
@@ -346,6 +361,7 @@ def extract_job_details(url: str, card_posted: str = "") -> dict:
         or _posted_from_node(soup)
         or card_posted
     )
+    facts = posting_facts(posting, plain_body)
     return {
         "experience": experience,
         "skill": listed_skills,
@@ -354,6 +370,10 @@ def extract_job_details(url: str, card_posted: str = "") -> dict:
         "job_description": job_description or plain_text(body),
         "posted_at": posted,
         "apply_url": apply_url_from_html(response.text, url),
+        "openings": facts["openings"],
+        "applicants": facts["applicants"],
+        "posted_by": facts["posted_by"] or poster_from_html(response.text),
+        "email": facts["email"],
     }
 
 
@@ -530,6 +550,10 @@ class LinkedIn:
                         about_company=details["about_company"] or "",
                         job_description=details["job_description"] or "",
                         apply_url=details.get("apply_url") or "",
+                        openings=details.get("openings") or "",
+                        applicants=details.get("applicants") or "",
+                        posted_by=details.get("posted_by") or "",
+                        poster_email=details.get("email") or "",
                     )
                     if not _matches_saved_search(
                         job,

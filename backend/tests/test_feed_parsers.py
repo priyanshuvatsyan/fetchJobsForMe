@@ -271,13 +271,10 @@ class FeedParserTests(unittest.TestCase):
         self.assertIs(kept, with_portal_key(kept))
 
     def test_saved_jobs_round_trip(self):
-        import tempfile
-        from pathlib import Path
-
         import Server.server as server
 
-        original = server.SAVED_FILE
-        server.SAVED_FILE = Path(tempfile.mkdtemp()) / "saved_jobs.json"
+        original = server._saved_memory
+        server._saved_memory = {}
         try:
             job = {
                 "portal": "4 Day Week",
@@ -288,20 +285,20 @@ class FeedParserTests(unittest.TestCase):
                 "description": {"about company": "", "job description": "Fix things"},
                 "unexpected": "dropped",
             }
-            stored = server.save_job(job)
+            stored = server.save_job("user-one", job)
             self.assertEqual(stored["portalKey"], "fourdayweek")
             self.assertTrue(stored["saved at"])
             self.assertNotIn("unexpected", stored)
-            self.assertEqual(server.save_job(job)["saved at"], stored["saved at"])
-            self.assertEqual(len(server.read_saved()), 1)
+            self.assertEqual(server.save_job("user-one", job)["saved at"], stored["saved at"])
+            self.assertEqual(len(server.read_saved("user-one")), 1)
+            self.assertEqual(server.read_saved("user-two"), [])
             with self.assertRaises(ValueError):
-                server.save_job({"role": "No link"})
-            self.assertTrue(server.unsave_job(job["link"]))
-            self.assertFalse(server.unsave_job(job["link"]))
-            self.assertEqual(server.read_saved(), [])
+                server.save_job("user-one", {"role": "No link"})
+            self.assertTrue(server.unsave_job("user-one", job["link"]))
+            self.assertFalse(server.unsave_job("user-one", job["link"]))
+            self.assertEqual(server.read_saved("user-one"), [])
         finally:
-            server.SAVED_FILE.unlink(missing_ok=True)
-            server.SAVED_FILE = original
+            server._saved_memory = original
 
     def test_resume_import_and_manual_profile_update(self):
         import base64
@@ -310,9 +307,22 @@ class FeedParserTests(unittest.TestCase):
 
         import Server.server as server
 
-        root = Path(tempfile.mkdtemp())
-        original_profile, original_resume = server.PROFILE_FILE, server.RESUME_DIR
-        server.PROFILE_FILE, server.RESUME_DIR = root / "profile.json", root / "resume"
+        store = {"data": None}
+
+        class _Document:
+            def get(self):
+                class _Snapshot:
+                    exists = store["data"] is not None
+                    def to_dict(_self):
+                        return dict(store["data"] or {})
+                return _Snapshot()
+
+            def set(self, data, merge=False):
+                current = dict(store["data"] or {})
+                store["data"] = {**current, **data} if merge else dict(data)
+
+        original_document = server._profile_document
+        server._profile_document = lambda uid: _Document()
         resume = """Shubhak Example
 Senior Backend Engineer
 shubhak@example.com | +91 9876543210
@@ -323,13 +333,19 @@ Backend engineer with 5 years of experience building Python and FastAPI services
 
 EXPERIENCE
 Senior Backend Engineer, Acme
+Jan 2022 - Present
+Bengaluru
 Built REST APIs with PostgreSQL, Docker, Kubernetes and Kafka.
+
+Software Engineer | Example Labs
+2019 - 2022
+Built the billing API.
 
 EDUCATION
 B.Tech Computer Science, Example University
 """
         try:
-            result = server.upload_resume({
+            result = server.upload_resume("user-one", {
                 "filename": "resume.txt",
                 "content": base64.b64encode(resume.encode()).decode(),
             })
@@ -339,7 +355,13 @@ B.Tech Computer Science, Example University
             self.assertIn("Python", profile["skills"])
             self.assertIn("FastAPI", profile["skills"])
             self.assertEqual(profile["resume"]["filename"], "resume.txt")
-            updated = server.update_profile({
+            roles = profile["experienceHistory"]
+            self.assertEqual([role["title"] for role in roles], ["Senior Backend Engineer", "Software Engineer"])
+            self.assertEqual(roles[0]["company"], "Acme")
+            self.assertEqual(roles[0]["endDate"], "Present")
+            self.assertEqual(roles[1]["company"], "Example Labs")
+            self.assertEqual(roles[1]["startDate"], "2019")
+            updated = server.update_profile("user-one", {
                 "targetRoles": ["Backend Engineer"],
                 "preferredLocations": ["Bengaluru", "Remote"],
                 "openToWork": True,
@@ -348,9 +370,64 @@ B.Tech Computer Science, Example University
             self.assertEqual(updated["targetRoles"], ["Backend Engineer"])
             self.assertGreater(updated["completion"], profile["completion"])
         finally:
-            server.PROFILE_FILE = original_profile
-            server.RESUME_DIR = original_resume
+            server._profile_document = original_document
 
+
+    def test_unstop_keeps_structure_and_fresher_eligibility(self):
+        from Server.api import split_description
+        from connectors.Unstop.Unstop import additional_information, experience_text
+
+        html = (
+            "<p><strong>About the Company</strong></p>\n<p>TipTap is a D2C brand.</p>\n"
+            "<p><strong>What We&rsquo;re Looking For:</strong></p>\n<p>A creator.</p>\n"
+            "<p><strong>What You&rsquo;ll Do:</strong></p>\n<ul><li>Shoot reels.</li><li>Edit videos.</li></ul>"
+        )
+        about, role = split_description(html)
+        self.assertIn("TipTap is a D2C brand.", about)
+        self.assertIn("\n- Shoot reels.\n- Edit videos.", role)
+        item = {
+            "filters": [
+                {"type": "eligible", "name": "Fresher"},
+                {"type": "eligible", "name": "Experienced Professionals"},
+            ],
+            "jobDetail": {"type": "in_office", "timing": "full_time"},
+        }
+        experience = experience_text({"min_experience": None}, "Content Creator", "", item)
+        self.assertEqual(experience, "Fresher")
+        extra = additional_information(item, experience)
+        self.assertIn("Job Type: In Office", extra)
+        self.assertIn("Eligibility: Fresher, Experienced Professionals", extra)
+
+    def test_posting_facts_keep_only_published_contact_and_counts(self):
+        from Server.api import Job, posting_facts
+        from Server.feeds import job_record
+
+        facts = posting_facts(
+            {
+                "totalJobOpenings": 3,
+                "applicationContact": {"name": "Ada Lovelace", "email": "ada@analytical.dev"},
+                "hiringOrganization": {"name": "Acme"},
+            },
+            "Applicants: 40+",
+        )
+        self.assertEqual(facts["posted_by"], "Ada Lovelace")
+        self.assertEqual(facts["email"], "ada@analytical.dev")
+        self.assertEqual(facts["openings"], "3")
+        self.assertEqual(facts["applicants"], "40+")
+        self.assertEqual(posting_facts({}, "Build APIs with Python.")["email"], "")
+        self.assertEqual(posting_facts({"hiringOrganization": {"name": "Acme"}}, "")["posted_by"], "")
+        record = job_record(Job(
+            source="Remotive",
+            title="Software Engineer",
+            company="Acme",
+            location="Remote",
+            url="https://example.com/job",
+            job_description="Posted by: Grace Hopper\nEmail: grace@hopper.dev\n2 openings",
+        ), "remotive")
+        self.assertEqual(record["description"]["posted by"], "Grace Hopper")
+        self.assertEqual(record["description"]["email"], "grace@hopper.dev")
+        self.assertEqual(record["description"]["openings"], "2")
+        self.assertNotIn("applicants", record["description"])
 
     def test_apply_link_falls_back_to_job_url(self):
         from Server.api import Job, apply_url_from_html
@@ -406,6 +483,34 @@ B.Tech Computer Science, Example University
         self.assertEqual(card["location"], "Hybrid work in Bengaluru, Karnataka")
         self.assertEqual(card["salary"], "₹10,00,000 a year")
         self.assertEqual(card["url"], "https://in.indeed.com/viewjob?jk=abc123")
+        traps = cards_from_html("""
+        <div class="job_seen_beacon" style="display:none">
+          <a class="jcs-JobTitle" data-jk="fedcba9876543210">Software Engineer</a>
+        </div>
+        <div class="job_seen_beacon">
+          <a class="jcs-JobTitle" data-jk="789abcdef0123456" href="/viewjob?jk=789abcdef0123456">Software Engineer</a>
+        </div>
+        <div class="job_seen_beacon">
+          <a class="jcs-JobTitle" data-jk="ignored" href="/rc/clk?jk=a1b2c3d4e5f60789">Software Engineer</a>
+        </div>
+        """)
+        self.assertEqual(
+            [card["url"] for card in traps],
+            ["https://in.indeed.com/viewjob?jk=a1b2c3d4e5f60789"],
+        )
+        from unittest import mock
+        from connectors.Indeed.Indeed import BLOCKED_NOTE, Indeed
+
+        connector = Indeed()
+        connector.warnings = []
+        connector._detail_blocked = False
+        challenge = mock.Mock(status_code=403, text='<div id="cf-box-container"></div>')
+        with mock.patch("connectors.Indeed.Indeed.requests.get", return_value=challenge) as get:
+            self.assertEqual(connector._read_detail("https://in.indeed.com/viewjob?jk=1"), {})
+            self.assertEqual(connector._read_detail("https://in.indeed.com/viewjob?jk=2"), {})
+        self.assertTrue(connector._detail_blocked)
+        self.assertEqual(connector.warnings, [BLOCKED_NOTE])
+        self.assertEqual(get.call_count, 2)
         self.assertTrue(is_tech_role(card["title"]))
         self.assertTrue(keeps_india_hybrid_or_remote(card["location"]))
         self.assertIn("l=India", search_url("software engineer", 0, remote=False, fromage=15))
@@ -532,16 +637,51 @@ B.Tech Computer Science, Example University
         self.assertNotIn("Beware of imposters", plain["description"])
         self.assertNotIn("Connect with us", plain["description"])
         self.assertNotIn("Apply on the go", plain["description"])
+        bold = detail_from_html("""
+        <section class="styles_job-desc-container__txpYf">
+          <div><h2>Job description</h2></div>
+          <div>
+            <div>
+              <p>We are seeking an experienced <strong>MRO Engineers</strong> with strong expertise in <strong>aerospace maintenance</strong>.</p>
+              <br>
+              <p><strong>Key Responsibilities</strong></p>
+              <ul>
+                <li>Investigate <strong>service damages</strong> on <strong>aero engine components</strong> and determine <strong>root causes</strong>.</li>
+              </ul>
+            </div>
+            <div class="styles_other-details__oEN4O">
+              <div><label>Role: </label><span><a>Other</a></span></div>
+              <div><label>Industry Type: </label><span>IT Services &amp; Consulting</span></div>
+            </div>
+            <div>
+              <div>Education</div>
+              <div><label>UG: </label><span>B.Tech / B.E. in Mechanical Engineering</span></div>
+            </div>
+          </div>
+          <div><div>Key Skills</div><div>Skills highlighted with preferred keyskills</div></div>
+        </section>
+        """)
+        self.assertIn(
+            "We are seeking an experienced MRO Engineers with strong expertise in aerospace maintenance.",
+            bold["description"],
+        )
+        self.assertIn("Key Responsibilities", bold["description"])
+        self.assertIn(
+            "- Investigate service damages on aero engine components and determine root causes.",
+            bold["description"],
+        )
+        self.assertNotIn("- service damages", bold["description"])
+        self.assertIn("Role: Other", bold["description"])
+        self.assertIn("Industry Type: IT Services & Consulting", bold["description"])
+        self.assertIn("UG: B.Tech / B.E. in Mechanical Engineering", bold["description"])
 
     def test_user_search_preferences_filter_jobs(self):
-        import tempfile
         from datetime import datetime, timedelta, timezone
-        from pathlib import Path
 
         import Server.server as server
 
-        original = server.PREFERENCES_DIR
-        server.PREFERENCES_DIR = Path(tempfile.mkdtemp()) / "preferences"
+        original = server._preferences_memory
+        server._preferences_memory = {}
         try:
             preferences = server.update_preferences("user-one", {
                 "experience": 3,
@@ -549,6 +689,7 @@ B.Tech Computer Science, Example University
                 "roles": ["DevOps", "ML"],
             })
             self.assertEqual(server.read_preferences("user-one"), preferences)
+            self.assertNotIn("geminiApiKey", preferences)
             now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             old = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
             jobs = [
@@ -580,8 +721,50 @@ B.Tech Computer Science, Example University
             ]}, broad)["jobs"]
             self.assertEqual(len(everything), 2)
             self.assertTrue(all(job["added on"] == recent for job in everything))
+            hidden = server.apply_preferences({"jobs": [
+                {"role": "Indeed role", "portalKey": "indeed", "experience": "", "skill": "", "added on": recent},
+                {"role": "LinkedIn role", "portalKey": "linkedin", "experience": "", "skill": "", "added on": recent},
+            ], "portals": [
+                {"key": "indeed", "label": "Indeed", "status": "idle"},
+                {"key": "linkedin", "label": "LinkedIn", "status": "idle"},
+            ]}, {**broad, "pausedPortals": ["indeed"]})
+            self.assertEqual([job["role"] for job in hidden["jobs"]], ["LinkedIn role"])
+            self.assertEqual(hidden["portals"][0]["status"], "paused")
+            self.assertEqual(server._empty_preferences()["pausedPortals"], ["instahyre", "naukri"])
         finally:
-            server.PREFERENCES_DIR = original
+            server._preferences_memory = original
+
+    def test_user_job_search_replaces_previous_results(self):
+        import Server.server as server
+
+        original = server._job_search_memory
+        server._job_search_memory = {}
+        try:
+            server.replace_user_jobs("user-one", {
+                "jobs": [
+                    {"role": "Old", "link": "https://jobs.example/old", "portal": "Naukri"},
+                    {"role": "Also old", "link": "https://jobs.example/old-2", "portal": "LinkedIn"},
+                ],
+                "loading": False,
+                "fetchedAt": "2026-10-01 00:00:00",
+            })
+            server.replace_user_jobs("user-one", {
+                "jobs": [{"role": "New", "link": "https://jobs.example/new", "portal": "Unstop"}],
+                "loading": False,
+                "fetchedAt": "2026-10-03 00:00:00",
+            })
+            stored = server.read_user_jobs("user-one")
+            self.assertEqual([job["role"] for job in stored["jobs"]], ["New"])
+            self.assertEqual(stored["fetchedAt"], "2026-10-03 00:00:00")
+            self.assertIsNone(server.read_user_jobs("user-two"))
+            parts = server._chunk_jobs([
+                {"role": str(index), "description": {"job description": "x" * 2000}}
+                for index in range(500)
+            ])
+            self.assertGreater(len(parts), 1)
+            self.assertEqual(sum(len(part) for part in parts), 500)
+        finally:
+            server._job_search_memory = original
 
 
 if __name__ == "__main__":

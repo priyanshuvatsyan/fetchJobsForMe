@@ -99,8 +99,8 @@ const JobsPage = () => {
 
         {notes.length ? (
           <Callout tone="warning" title={`${notes.length} portal ${notes.length === 1 ? 'note' : 'notes'}`}>
-            <ul>
-              {notes.slice(0, 4).map((note, index) => (
+            <ul className="callout-notes">
+              {notes.map((note, index) => (
                 <li key={index}>
                   <strong>{note.portal}:</strong> {note.message}
                 </li>

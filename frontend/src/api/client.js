@@ -1,3 +1,4 @@
+import { signOut } from 'firebase/auth'
 import { auth } from '../firebase'
 
 const BASE_URL = (import.meta.env.VITE_JOBS_API_URL || 'https://fetchjobsforme.onrender.com').replace(/\/$/, '')
@@ -7,6 +8,29 @@ export class ApiError extends Error {
     super(message)
     this.name = 'ApiError'
     this.status = status
+  }
+}
+
+const expiredSession = new Set([
+  'auth/user-token-expired',
+  'auth/user-disabled',
+  'auth/invalid-user-token',
+  'auth/user-not-found',
+  'auth/invalid-credential',
+])
+
+let endingSession = false
+
+async function endSession() {
+  if (endingSession) return
+  endingSession = true
+  try {
+    await signOut(auth)
+  } catch {
+    // The Firebase user is already gone.
+  }
+  if (!window.location.pathname.startsWith('/login')) {
+    window.location.replace('/login')
   }
 }
 
@@ -23,7 +47,15 @@ function toQueryString(params) {
 async function request(method, path, { params = {}, body, signal } = {}) {
   // Retrieve Firebase ID token if user is signed in
   const currentUser = auth.currentUser
-  const token = currentUser ? await currentUser.getIdToken() : null
+  let token = null
+  if (currentUser) {
+    try {
+      token = await currentUser.getIdToken()
+    } catch (error) {
+      if (expiredSession.has(error?.code)) await endSession()
+      throw new ApiError('sign in is required', 401)
+    }
+  }
 
   let response
   try {
@@ -46,6 +78,9 @@ async function request(method, path, { params = {}, body, signal } = {}) {
   }
 
   const payload = await response.json().catch(() => null)
+  if (response.status === 401 && token) {
+    await endSession()
+  }
   if (!response.ok) {
     throw new ApiError(payload?.error || `Request failed with status ${response.status}`, response.status)
   }

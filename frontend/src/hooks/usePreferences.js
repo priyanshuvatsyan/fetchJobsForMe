@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useState } from 'react'
 import { fetchPreferences, savePreferences } from '../api/preferences'
 
+export const DEFAULT_PAUSED_PORTALS = ['instahyre', 'naukri']
+
 export const DEFAULT_PREFERENCES = {
   experience: null,
   posted: 'all',
   roles: [],
+  pausedPortals: DEFAULT_PAUSED_PORTALS,
   geminiApiKey: '',
   updatedAt: '',
 }
@@ -34,7 +37,13 @@ export default function usePreferences() {
     setError(null)
     try {
       const result = await savePreferences(next)
-      setPreferences({ ...DEFAULT_PREFERENCES, ...result })
+      setPreferences((current) => ({
+        ...DEFAULT_PREFERENCES,
+        ...current,
+        ...result,
+        apiKey: result.apiKey || result.geminiApiKey || current.apiKey || '',
+        pausedPortals: result.pausedPortals ?? current.pausedPortals,
+      }))
       setStatus('saved')
       return true
     } catch (cause) {

@@ -60,6 +60,18 @@
   padding-left: 2px;
 }
 
+.job-description-heading {
+  margin: 10px 0 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--jb-text);
+}
+
+.job-description-title + .job-description-heading {
+  margin-top: 0;
+}
+
 .job-description-bullet span {
   color: var(--jb-accent-soft);
 }

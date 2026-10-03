@@ -172,6 +172,8 @@ const JobCard = ({ job, defaultExpanded = false, saved = false, onToggleSave }) 
             jobDescription={job.jobDescription}
             openings={job.openings}
             applicants={job.applicants}
+            postedBy={job.postedBy}
+            posterEmail={job.posterEmail}
           />
         </div>
       ) : null}

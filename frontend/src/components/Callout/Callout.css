@@ -9,6 +9,11 @@
   background: var(--jb-surface-2);
 }
 
+.callout-body {
+  flex: 1;
+  min-width: 0;
+}
+
 .callout-title {
   margin: 0 0 4px;
   font-size: 14px;
@@ -29,6 +34,17 @@
 .callout-content ul {
   margin: 0;
   padding-left: 18px;
+}
+
+.callout-notes {
+  max-height: 4.8em;
+  overflow-y: auto;
+  scrollbar-width: none;
+  overflow-wrap: anywhere;
+}
+
+.callout-notes::-webkit-scrollbar {
+  display: none;
 }
 
 .callout-action {

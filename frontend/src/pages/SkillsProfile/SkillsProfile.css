@@ -293,6 +293,24 @@
 .profile-empty { margin: 16px 0 0; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
 .profile-prose { color: #d7dee8; }
 
+.profile-jobs { display: grid; gap: 16px; margin-top: 16px; }
+.profile-job { display: grid; gap: 12px; padding: 14px; border: 1px solid #2a3241; border-radius: 10px; }
+.profile-job-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.profile-job-heading strong { font-size: 13px; }
+.profile-job .profile-grid { padding-top: 0; }
+.profile-add {
+  justify-self: start;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid #3a4254;
+  border-radius: 8px;
+  background: transparent;
+  color: #d5dbe6;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
 .profile-role { display: grid; gap: 3px; margin-top: 16px; }
 .profile-role strong { font-size: 15px; }
 .profile-role span { color: #8d98aa; font-size: 12px; }

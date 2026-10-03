@@ -228,9 +228,152 @@
   font-size: 11px;
 }
 
+.portal-preferences {
+  display: grid;
+  gap: 14px;
+}
+
+.portal-preferences > p {
+  margin: 0;
+  color: #7e899b;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.portal-toggle-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 520px;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.portal-toggle-list::-webkit-scrollbar { display: none; }
+
+.portal-toggle-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 42px;
+  padding: 0 12px;
+  border: 1px solid #242b38;
+  border-radius: 8px;
+  background: #0d1119;
+}
+
+.portal-toggle-list li > span {
+  min-width: 0;
+  overflow: hidden;
+  color: #e4e9f1;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.portal-switch {
+  width: 36px;
+  height: 20px;
+  flex: 0 0 36px;
+  padding: 2px;
+  border: 0;
+  border-radius: 999px;
+  background: #2a3344;
+  cursor: pointer;
+}
+
+.portal-switch span {
+  display: block;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #9aa6b8;
+  transition: transform 0.15s ease;
+}
+
+.portal-switch.is-on { background: #6d5dfc; }
+.portal-switch.is-on span { transform: translateX(16px); background: #fff; }
+.portal-switch:disabled { opacity: 0.6; cursor: progress; }
+
+.app-root[data-theme='light'] .search-preferences-head p,
+.app-root[data-theme='light'] .settings-rule,
+.app-root[data-theme='light'] .settings-muted,
+.app-root[data-theme='light'] .settings-form small,
+.app-root[data-theme='light'] .portal-preferences > p {
+  color: #66748a;
+}
+
+.app-root[data-theme='light'] .settings-edit,
+.app-root[data-theme='light'] .settings-cancel {
+  border-color: #d5dbe6;
+  background: #fff;
+  color: #31415c;
+}
+
+.app-root[data-theme='light'] .settings-form label > span,
+.app-root[data-theme='light'] .settings-values dt {
+  color: #7b879a;
+}
+
+.app-root[data-theme='light'] .settings-form input,
+.app-root[data-theme='light'] .settings-form select,
+.app-root[data-theme='light'] .settings-values div,
+.app-root[data-theme='light'] .portal-toggle-list li {
+  border-color: #dce2eb;
+  background: #fff;
+  color: #202b40;
+}
+
+.app-root[data-theme='light'] .settings-values dd,
+.app-root[data-theme='light'] .portal-toggle-list li > span {
+  color: #202b40;
+}
+
+.app-root[data-theme='light'] .settings-action-btn,
+.app-root[data-theme='light'] .settings-toggle-visibility {
+  color: #66748a;
+}
+
+.app-root[data-theme='light'] .settings-action-btn:hover,
+.app-root[data-theme='light'] .settings-toggle-visibility:hover {
+  color: #202b40;
+}
+
+.app-root[data-theme='light'] .settings-rule {
+  border-top-color: #e2e6ed;
+}
+
+.app-root[data-theme='light'] .portal-switch {
+  background: #d5dbe6;
+}
+
+.app-root[data-theme='light'] .portal-switch span {
+  background: #fff;
+}
+
+.app-root[data-theme='light'] .portal-switch.is-on,
+.app-root[data-theme='light'] .portal-switch.is-on:disabled {
+  background: #6d5dfc;
+}
+
+.app-root[data-theme='light'] .portal-switch.is-on span {
+  background: #fff;
+}
+
+@media (max-width: 1100px) {
+  .portal-toggle-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 @media (max-width: 620px) {
   .settings-form,
-  .settings-values {
+  .settings-values,
+  .portal-toggle-list {
     grid-template-columns: 1fr;
   }
 }

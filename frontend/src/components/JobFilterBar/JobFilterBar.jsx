@@ -35,7 +35,7 @@ const JobFilterBar = ({ filters, portals, onChange, onReset, busy }) => {
           label="Location"
           value={filters.where}
           onChange={set('where')}
-          placeholder="Bengaluru, Remote…"
+          placeholder="Bengaluru, Hyderabad, Remote"
           icon="📍"
         />
         <SelectField
